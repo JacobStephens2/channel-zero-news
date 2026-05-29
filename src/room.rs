@@ -18,10 +18,11 @@
 
 use tokio::sync::{broadcast, mpsc};
 
+use crate::db::Db;
 use crate::protocol::{
     ClientMsg, ErrorCode, PlayerStatus, Role, RoomSnapshot, ServerMsg,
 };
-use crate::state::{GameState, PromptSet, TransitionError};
+use crate::state::{ArchivedEntry, GameState, PromptSet, TransitionError};
 
 /// Capacity of a room's command queue.
 const COMMAND_QUEUE: usize = 64;
@@ -39,13 +40,26 @@ pub struct Command {
     pub direct: mpsc::UnboundedSender<ServerMsg>,
 }
 
-/// The set of messages a single command produces.
+/// A durable side effect for the actor to run against the database, produced by
+/// the pure reducer but executed by the async actor loop (best-effort: a DB
+/// failure is logged and never corrupts the in-memory game).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Effect {
+    /// Persist the round's finalized responses (on game start).
+    SaveFinalResponses(Vec<ArchivedEntry>),
+    /// Archive the round's responses (on archive).
+    ArchiveRound(Vec<ArchivedEntry>),
+}
+
+/// The set of messages and effects a single command produces.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct Reaction {
     /// Fanned out to every subscriber of the room.
     pub broadcasts: Vec<ServerMsg>,
     /// Sent only to the originating connection.
     pub direct: Vec<ServerMsg>,
+    /// Durable side effects to run against the database.
+    pub effects: Vec<Effect>,
 }
 
 impl Reaction {
@@ -53,6 +67,7 @@ impl Reaction {
         Reaction {
             broadcasts: vec![],
             direct: vec![msg],
+            effects: vec![],
         }
     }
 }
@@ -82,11 +97,13 @@ impl RoomHandle {
     }
 }
 
-/// Spawn a room actor and return a handle to it.
+/// Spawn a room actor and return a handle to it. `db` is `None` in tests and
+/// no-database runs, in which case durable effects are simply skipped.
 pub fn spawn_room(
     code: impl Into<String>,
     prompt_sets: Vec<PromptSet>,
     host_token: impl Into<String>,
+    db: Option<Db>,
 ) -> RoomHandle {
     let code = code.into();
     let host_token = host_token.into();
@@ -94,7 +111,7 @@ pub fn spawn_room(
     let (events_tx, _events_rx) = broadcast::channel(BROADCAST_BUFFER);
 
     let state = GameState::new(code.clone(), prompt_sets);
-    tokio::spawn(run(state, host_token.clone(), cmd_rx, events_tx.clone()));
+    tokio::spawn(run(state, host_token.clone(), cmd_rx, events_tx.clone(), db));
 
     RoomHandle {
         code,
@@ -110,6 +127,7 @@ async fn run(
     host_token: String,
     mut cmd_rx: mpsc::Receiver<Command>,
     events_tx: broadcast::Sender<ServerMsg>,
+    db: Option<Db>,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
         let reaction = apply(
@@ -127,8 +145,28 @@ async fn run(
             // Errs only if the originating connection has gone away.
             let _ = cmd.direct.send(msg);
         }
+        for effect in reaction.effects {
+            run_effect(&db, &state.code, effect).await;
+        }
     }
     tracing::debug!(room = %state.code, "room actor stopped");
+}
+
+/// Execute a durable effect. Best-effort: failures are logged, never fatal to
+/// the in-memory game.
+async fn run_effect(db: &Option<Db>, code: &str, effect: Effect) {
+    let Some(db) = db else { return };
+    match effect {
+        Effect::SaveFinalResponses(entries) => {
+            if let Err(e) = db.save_final_responses(code, &entries).await {
+                tracing::error!(room = %code, error = %e, "failed to persist final responses");
+            }
+        }
+        Effect::ArchiveRound(entries) => match db.archive_round(code, &entries).await {
+            Ok(batch) => tracing::info!(room = %code, batch = %batch, "archived round"),
+            Err(e) => tracing::error!(room = %code, error = %e, "failed to archive round"),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +219,8 @@ pub fn apply(
                         room_state(state),
                     ],
                     direct: vec![],
+                    // The round's responses are now final — persist them.
+                    effects: vec![Effect::SaveFinalResponses(state.round_entries())],
                 },
                 Err(e) => Reaction::direct_only(transition_error(e)),
             },
@@ -195,9 +235,10 @@ pub fn apply(
             // The returned snapshot is what the persistence layer (M5) writes;
             // here we just transition and broadcast the new state.
             Ok(()) => match state.archive_round() {
-                Ok(_entries) => Reaction {
+                Ok(entries) => Reaction {
                     broadcasts: vec![room_state(state)],
                     direct: vec![],
+                    effects: vec![Effect::ArchiveRound(entries)],
                 },
                 Err(e) => Reaction::direct_only(transition_error(e)),
             },
@@ -243,6 +284,7 @@ fn join(
     Reaction {
         broadcasts: vec![],
         direct,
+        effects: vec![],
     }
 }
 
@@ -258,6 +300,7 @@ where
         Ok(()) => Reaction {
             broadcasts: vec![room_state(state), progress(state)],
             direct: vec![],
+            effects: vec![],
         },
         Err(e) => Reaction::direct_only(transition_error(e)),
     }
@@ -275,6 +318,7 @@ where
         Ok(_) => Reaction {
             broadcasts: vec![slide_changed(state), room_state(state)],
             direct: vec![],
+            effects: vec![],
         },
         Err(e) => Reaction::direct_only(transition_error(e)),
     }
@@ -303,6 +347,7 @@ fn submit(
         Ok(()) => Reaction {
             broadcasts: vec![progress(state), room_state(state)],
             direct: vec![],
+            effects: vec![],
         },
         Err(e) => Reaction::direct_only(transition_error(e)),
     }
@@ -509,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_subscribers_receive_the_same_broadcast() {
-        let handle = spawn_room("ABCD", sets(), "tok");
+        let handle = spawn_room("ABCD", sets(), "tok", None);
         let mut a = handle.subscribe();
         let mut b = handle.subscribe();
 
@@ -538,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn forbidden_action_replies_direct_not_broadcast() {
-        let handle = spawn_room("ABCD", sets(), "tok");
+        let handle = spawn_room("ABCD", sets(), "tok", None);
         let mut bcast = handle.subscribe();
         let (direct, mut direct_rx) = mpsc::unbounded_channel();
 

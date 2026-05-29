@@ -7,17 +7,31 @@
 use std::net::SocketAddr;
 
 use channel_zero::app::{build_router, AppState};
+use channel_zero::db::Db;
 use channel_zero::state::PromptSet;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     init_tracing();
 
-    // M4: seed the prompt catalog in memory. M5 loads it from Postgres
-    // (migrated from the live MySQL `tblPrompts`).
-    let prompts = seed_prompt_sets();
-    let state = AppState::new(prompts);
+    // Connect to Postgres if configured; otherwise fall back to an in-memory
+    // seed catalog so the server still runs (handy for local smoke tests).
+    let state = match std::env::var("DATABASE_URL") {
+        Ok(url) => {
+            let db = Db::connect(&url)
+                .await
+                .expect("failed to connect to DATABASE_URL");
+            db.migrate().await.expect("database migration failed");
+            tracing::info!("connected to Postgres; persistence enabled");
+            AppState::with_db(db)
+        }
+        Err(_) => {
+            tracing::warn!("DATABASE_URL not set; running in-memory with a seed catalog");
+            AppState::in_memory(seed_prompt_sets())
+        }
+    };
 
     let static_dir = std::env::var("CHANNEL_ZERO_STATIC").unwrap_or_else(|_| "static".to_string());
     let app = build_router(state, &static_dir);

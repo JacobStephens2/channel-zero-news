@@ -24,7 +24,7 @@ fn prompt_sets() -> Vec<PromptSet> {
 }
 
 async fn spawn_server() -> String {
-    let state = AppState::new(prompt_sets());
+    let state = AppState::in_memory(prompt_sets());
     let app = build_router(state, "static");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

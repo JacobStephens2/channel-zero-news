@@ -27,14 +27,15 @@ pub struct CreateRoomResponse {
 pub async fn create_room(
     State(state): State<AppState>,
 ) -> Result<Json<CreateRoomResponse>, AppError> {
-    if state.prompts.is_empty() {
+    let prompts = state.prompt_catalog().await?;
+    if prompts.is_empty() {
         return Err(AppError::Internal(
             "no prompt sets configured; cannot create a room".into(),
         ));
     }
     let room = state
         .registry
-        .create_room((*state.prompts).clone())
+        .create_room(prompts, state.db.clone())
         .await;
     Ok(Json(CreateRoomResponse {
         code: room.code,
@@ -57,6 +58,8 @@ pub async fn room_info(
 }
 
 /// Expose the prompt-set catalog (used by host/prompt-management UIs).
-pub async fn list_prompt_sets(State(state): State<AppState>) -> Json<Vec<PromptSet>> {
-    Json((*state.prompts).clone())
+pub async fn list_prompt_sets(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<PromptSet>>, AppError> {
+    Ok(Json(state.prompt_catalog().await?))
 }

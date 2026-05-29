@@ -365,13 +365,11 @@ impl GameState {
 
     // ----- archive + reset ----------------------------------------------------
 
-    /// Snapshot every player's answers (with the prompts they answered) and move
-    /// the room to `Archived`. The returned entries are what the persistence
-    /// layer writes to the durable archive table.
-    pub fn archive_round(&mut self) -> Result<Vec<ArchivedEntry>, TransitionError> {
-        self.require_phase(Phase::Performing)?;
-        let entries = self
-            .players
+    /// Snapshot every player's answers paired with the prompts they answered.
+    /// This is the durable artifact the persistence layer writes — both for a
+    /// round's finalized responses and for the archive.
+    pub fn round_entries(&self) -> Vec<ArchivedEntry> {
+        self.players
             .iter()
             .map(|p| {
                 let prompts = p
@@ -389,7 +387,13 @@ impl GameState {
                     signoff: responses.signoff,
                 }
             })
-            .collect();
+            .collect()
+    }
+
+    /// Snapshot the round and move the room to `Archived`.
+    pub fn archive_round(&mut self) -> Result<Vec<ArchivedEntry>, TransitionError> {
+        self.require_phase(Phase::Performing)?;
+        let entries = self.round_entries();
         self.phase = Phase::Archived;
         Ok(entries)
     }

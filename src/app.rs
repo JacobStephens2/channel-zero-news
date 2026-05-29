@@ -10,6 +10,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
+use crate::db::Db;
+use crate::error::AppError;
 use crate::registry::Registry;
 use crate::state::PromptSet;
 use crate::{routes, ws};
@@ -18,18 +20,40 @@ use crate::{routes, ws};
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Arc<Registry>,
-    /// The prompt-set catalog handed to each new room.
-    ///
-    /// M4 seeds this in memory; M5 replaces the source with the Postgres-backed
-    /// catalog so prompt management persists.
-    pub prompts: Arc<Vec<PromptSet>>,
+    /// The Postgres-backed persistence layer. `None` runs the game fully in
+    /// memory (used by integration tests and DB-less runs).
+    pub db: Option<Db>,
+    /// Prompt catalog used only when `db` is `None`.
+    seed_prompts: Arc<Vec<PromptSet>>,
 }
 
 impl AppState {
-    pub fn new(prompts: Vec<PromptSet>) -> Self {
+    /// In-memory mode: prompt catalog from a seed, no persistence.
+    pub fn in_memory(prompts: Vec<PromptSet>) -> Self {
         Self {
             registry: Registry::new(),
-            prompts: Arc::new(prompts),
+            db: None,
+            seed_prompts: Arc::new(prompts),
+        }
+    }
+
+    /// Database-backed mode: prompt catalog and durable artifacts in Postgres.
+    pub fn with_db(db: Db) -> Self {
+        Self {
+            registry: Registry::new(),
+            db: Some(db),
+            seed_prompts: Arc::new(Vec::new()),
+        }
+    }
+
+    /// The current prompt-set catalog (from Postgres, or the in-memory seed).
+    pub async fn prompt_catalog(&self) -> Result<Vec<PromptSet>, AppError> {
+        match &self.db {
+            Some(db) => db
+                .load_prompt_sets()
+                .await
+                .map_err(|e| AppError::Internal(format!("loading prompt sets: {e}"))),
+            None => Ok((*self.seed_prompts).clone()),
         }
     }
 }

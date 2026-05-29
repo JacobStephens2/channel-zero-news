@@ -12,6 +12,7 @@ use std::sync::Arc;
 use rand::Rng;
 use tokio::sync::RwLock;
 
+use crate::db::Db;
 use crate::room::{spawn_room, RoomHandle};
 use crate::state::PromptSet;
 
@@ -38,8 +39,9 @@ impl Registry {
     }
 
     /// Create a room with the given prompt-set catalog and start its actor.
-    /// Generates a unique join code and a secret host token.
-    pub async fn create_room(&self, prompt_sets: Vec<PromptSet>) -> NewRoom {
+    /// Generates a unique join code and a secret host token. `db` is handed to
+    /// the room actor for durable effects (`None` to disable persistence).
+    pub async fn create_room(&self, prompt_sets: Vec<PromptSet>, db: Option<Db>) -> NewRoom {
         let host_token = random_token();
         let mut rooms = self.rooms.write().await;
         let code = loop {
@@ -48,7 +50,7 @@ impl Registry {
                 break candidate;
             }
         };
-        let handle = spawn_room(code.clone(), prompt_sets, host_token.clone());
+        let handle = spawn_room(code.clone(), prompt_sets, host_token.clone(), db);
         rooms.insert(code.clone(), handle);
         NewRoom { code, host_token }
     }
@@ -97,7 +99,7 @@ mod tests {
     #[tokio::test]
     async fn create_and_lookup() {
         let reg = Registry::new();
-        let room = reg.create_room(sets()).await;
+        let room = reg.create_room(sets(), None).await;
         assert_eq!(room.code.len(), CODE_LEN);
         assert!(reg.get(&room.code).await.is_some());
         assert!(reg.get("ZZZZ").await.is_none());
@@ -109,7 +111,7 @@ mod tests {
         let reg = Registry::new();
         let mut codes = std::collections::HashSet::new();
         for _ in 0..50 {
-            let room = reg.create_room(sets()).await;
+            let room = reg.create_room(sets(), None).await;
             assert!(codes.insert(room.code), "duplicate code generated");
         }
         assert_eq!(reg.count().await, 50);
