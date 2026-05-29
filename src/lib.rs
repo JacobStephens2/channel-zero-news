@@ -4,4 +4,6 @@
 //! persistence layers can be unit-tested independently of the Axum binary.
 
 pub mod protocol;
+pub mod registry;
+pub mod room;
 pub mod state;

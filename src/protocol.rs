@@ -41,6 +41,10 @@ pub enum ClientMsg {
         role: Role,
         #[serde(default)]
         name: Option<String>,
+        /// Required when joining as [`Role::Host`]; ignored otherwise. Issued by
+        /// the REST `create room` call so host authority is enforced server-side.
+        #[serde(default)]
+        token: Option<String>,
     },
     /// Host: add a name to the roster (Lobby only).
     AddPlayer { name: String },
@@ -151,6 +155,7 @@ mod tests {
             code: "ABCD".into(),
             role: Role::Player,
             name: Some("Ann".into()),
+            token: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"join_room\""));
