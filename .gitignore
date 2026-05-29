@@ -1,0 +1,10 @@
+# Rust build output (symlinked to the data volume)
+/target
+
+# Local environment / secrets
+.env
+.env.local
+
+# Editor noise
+*.swp
+.DS_Store
