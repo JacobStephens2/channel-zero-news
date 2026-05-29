@@ -1,7 +1,21 @@
 # Deployment
 
-Live at **https://channel0.stephens.page** (runs in parallel with the original
-PHP game on zero/channelzeronews.stephens.page).
+Live (canonical) at **https://channelzeronews.stephens.page**, also on
+**channelzeronews.stewardgoods.com**, **zero.stephens.page**, and
+**channel0.stephens.page** — all reverse-proxied to the one `channel-zero`
+service. The production domains were **cut over from the old PHP app** on
+2026-05-29 (their `:443` vhosts repointed from `DocumentRoot /var/www/zero...`
+to the proxy; see `channelzeronews.stephens.page-le-ssl.conf` here for the shape).
+A self-unregistering `static/sw.js` clears the old PWA service worker so returning
+visitors load the new client.
+
+### Revert the cutover
+
+The original vhosts were backed up before editing (path printed during cutover,
+under `/tmp/cz-cutover-backup-*`). To roll back a domain, restore its
+`*-le-ssl.conf.bak` to `/etc/apache2/sites-available/<domain>-le-ssl.conf`,
+`apache2ctl configtest`, and `systemctl reload apache2`. The PHP app and its
+MySQL data are untouched.
 
 ## Pieces
 
