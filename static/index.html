@@ -7,10 +7,10 @@
 <style>
   :root { --bg:#0b0f17; --panel:#141b29; --ink:#e8eef7; --muted:#8aa0bf; --accent:#ff3b3b; --ok:#36d399; --line:#243049; }
   * { box-sizing: border-box; }
-  body { margin:0; font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  body { margin:0; font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); overflow-x:hidden; }
   header { background:var(--accent); color:#fff; padding:10px 16px; font-weight:800; letter-spacing:.5px; display:flex; gap:12px; align-items:center; }
   header .live { font-size:11px; background:#000; padding:2px 8px; border-radius:99px; }
-  main { max-width:960px; margin:0 auto; padding:16px; display:grid; gap:16px; grid-template-columns:1fr 1fr; }
+  main { max-width:960px; margin:0 auto; padding:16px; display:grid; gap:16px; grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
   .panel h2 { margin:0 0 10px; font-size:14px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); }
   .full { grid-column:1/3; }
@@ -28,7 +28,7 @@
   .players { list-style:none; padding:0; margin:0; display:flex; flex-direction:column; gap:6px; }
   .players li { display:flex; justify-content:space-between; padding:6px 10px; background:#0c121d; border:1px solid var(--line); border-radius:7px; }
   .submitted { color:var(--ok); }
-  #log { font-family:ui-monospace,Menlo,monospace; font-size:12px; height:200px; overflow:auto; background:#0c121d; border:1px solid var(--line); border-radius:7px; padding:8px; white-space:pre-wrap; }
+  #log { font-family:ui-monospace,Menlo,monospace; font-size:12px; height:200px; overflow:auto; background:#0c121d; border:1px solid var(--line); border-radius:7px; padding:8px; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
   #slide { min-height:160px; display:flex; align-items:center; justify-content:center; text-align:center; font-size:20px; padding:20px; background:#0c121d; border:1px dashed var(--line); border-radius:10px; }
   .muted { color:var(--muted); }
   .hidden { display:none; }
@@ -36,7 +36,7 @@
   /* Phone widths: one column so the panels aren't cramped, and stack the
      cramped input/button rows vertically. */
   @media (max-width: 720px) {
-    main { grid-template-columns:1fr; }
+    main { grid-template-columns:minmax(0,1fr); }
     .full { grid-column:1; }
     .row { flex-direction:column; align-items:stretch; }
     .row > button { width:100%; }
