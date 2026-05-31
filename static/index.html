@@ -148,6 +148,11 @@ function applyRoleUI() {
   $("createBtn").classList.toggle("hidden", role !== "host");
   $("hostPanel").classList.toggle("hidden", role !== "host");
   $("playerPanel").classList.toggle("hidden", role !== "player");
+  // The host creates a room and is *given* a code; only players/display type
+  // one in to join. Hiding the code input avoids the impression that a typed
+  // code is used at creation (the server always assigns a fresh unique code).
+  $("codeField").classList.toggle("hidden", role === "host");
+  $("joinBtn").classList.toggle("hidden", role === "host");
 }
 $("role").addEventListener("change", applyRoleUI);
 
