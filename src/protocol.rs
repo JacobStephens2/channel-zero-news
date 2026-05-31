@@ -138,6 +138,10 @@ pub enum ServerMsg {
         index: usize,
         total_slides: usize,
         slide: Slide,
+        /// The player who may advance this slide (the reader of the segment, or
+        /// the first presenter on the rules slide). `None` for host-only slides.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        controller: Option<String>,
     },
     /// A rejected intent or other error.
     Error { code: ErrorCode, message: String },

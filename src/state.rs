@@ -18,6 +18,17 @@ use serde::{Deserialize, Serialize};
 /// Maximum number of prompts in a prompt set (mirrors `tblPrompts.prompt1..7`).
 pub const MAX_PROMPTS: usize = 7;
 
+/// Who reads/controls a given slide, if anyone (the presenter of that segment).
+fn slide_controller(slide: &Slide) -> Option<String> {
+    match slide {
+        Slide::Script { reader, .. } => Some(reader.clone()),
+        Slide::Greeting { presenter }
+        | Slide::Signoff { presenter, .. }
+        | Slide::PresenterIntro { presenter, .. } => Some(presenter.clone()),
+        Slide::Rules | Slide::Credits | Slide::Blank => None,
+    }
+}
+
 /// A prompt set: a themed list of up to [`MAX_PROMPTS`] prompt lines, plus a
 /// fixed sign-off prompt that always closes a player's segment.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -364,15 +375,16 @@ impl GameState {
     }
 
     /// The player allowed to advance the *current* slide: the presenter of their
-    /// own segment (intro → greeting → scripts → sign-off). Transition slides
-    /// (rules / credits / blank) have no controller and are host-only.
+    /// own segment (intro → greeting → scripts → sign-off). On the opening rules
+    /// slide this is the first presenter, so they can start the show themselves.
+    /// The closing credits / blank slides have no controller (host-only).
     pub fn current_controller(&self) -> Option<String> {
         match self.slide_at(self.current_slide)? {
-            Slide::Script { reader, .. } => Some(reader),
-            Slide::Greeting { presenter }
-            | Slide::Signoff { presenter, .. }
-            | Slide::PresenterIntro { presenter, .. } => Some(presenter),
-            Slide::Rules | Slide::Credits | Slide::Blank => None,
+            // The first presenter starts the show from the rules slide.
+            Slide::Rules => self
+                .slide_at(self.current_slide + 1)
+                .and_then(|s| slide_controller(&s)),
+            other => slide_controller(&other),
         }
     }
 

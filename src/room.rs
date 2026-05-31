@@ -449,6 +449,7 @@ fn slide_changed(state: &GameState) -> ServerMsg {
         slide: state
             .slide_at(state.current_slide)
             .unwrap_or(crate::state::Slide::Blank),
+        controller: state.current_controller(),
     }
 }
 
@@ -653,7 +654,7 @@ mod tests {
                 .submit_responses(n, vec!["x".into(); cnt], "s".into())
                 .unwrap();
         }
-        state.start_game().unwrap(); // slide 0 = rules (host-only)
+        state.start_game().unwrap(); // slide 0 = rules
 
         let forbidden = |r: &Reaction| {
             matches!(
@@ -662,22 +663,23 @@ mod tests {
             ) && r.broadcasts.is_empty()
         };
 
-        // On the rules slide a player cannot advance...
-        let r = apply(&mut state, &token, Role::Player, Some("Bo"), ClientMsg::AdvanceSlide);
-        assert!(forbidden(&r));
-        // ...the host moves to slide 1 (Bo's presenter intro)...
-        let r = apply(&mut state, &token, Role::Host, None, ClientMsg::AdvanceSlide);
-        assert!(!r.broadcasts.is_empty());
+        // The first presenter (Bo, Ann's partner) controls the rules slide and
+        // may start the show; a non-presenter cannot.
         assert_eq!(state.current_controller().as_deref(), Some("Bo"));
-        // ...now Bo (the reader) can advance their own segment...
+        let r = apply(&mut state, &token, Role::Player, Some("Ann"), ClientMsg::AdvanceSlide);
+        assert!(forbidden(&r));
         let r = apply(&mut state, &token, Role::Player, Some("Bo"), ClientMsg::AdvanceSlide);
         assert!(r
             .broadcasts
             .iter()
             .any(|m| matches!(m, ServerMsg::SlideChanged { .. })));
-        // ...but another player cannot move Bo's segment.
+        assert_eq!(state.current_slide, 1); // Bo's presenter intro
+
+        // Bo keeps control of their own segment; Ann still cannot move it.
         let r = apply(&mut state, &token, Role::Player, Some("Ann"), ClientMsg::AdvanceSlide);
         assert!(forbidden(&r));
+        let r = apply(&mut state, &token, Role::Player, Some("Bo"), ClientMsg::AdvanceSlide);
+        assert!(!r.broadcasts.is_empty());
     }
 
     #[tokio::test]

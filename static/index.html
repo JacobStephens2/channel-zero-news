@@ -316,23 +316,13 @@ function readingBanner(reader) {
   return `<div class="reading-now">🎤 <strong>${escapeHtml(reader)}</strong> is reading…</div>`;
 }
 
-// Who may advance the current slide: the presenter of their own segment
-// (intro → greeting → scripts → sign-off). Mirrors the server's check.
-function controllerOf(s) {
-  switch (s.kind) {
-    case "script": return s.reader;
-    case "greeting":
-    case "signoff":
-    case "presenter_intro": return s.presenter;
-    default: return null;
-  }
-}
-
 function renderSlide(msg) {
   $("slideIdx").textContent = `${msg.index} / ${msg.total_slides}`;
   const s = msg.slide;
   const reader = readerOf(s);
-  const controller = controllerOf(s);
+  // The server tells us who may advance this slide (handles the rules slide,
+  // where the first presenter — not derivable from the slide alone — controls).
+  const controller = msg.controller || null;
   const content = slideContentHtml(s);
   const el = $("slide");
   el.classList.remove("muted");
