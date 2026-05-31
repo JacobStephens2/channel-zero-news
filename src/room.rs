@@ -226,9 +226,9 @@ pub fn apply(
             },
         },
 
-        ClientMsg::AdvanceSlide => host_slide(role, state, |s| s.advance_slide()),
-        ClientMsg::PrevSlide => host_slide(role, state, |s| s.prev_slide()),
-        ClientMsg::GotoSlide { index } => host_slide(role, state, move |s| s.goto_slide(index)),
+        ClientMsg::AdvanceSlide => control_slide(state, role, name, |s| s.advance_slide()),
+        ClientMsg::PrevSlide => control_slide(state, role, name, |s| s.prev_slide()),
+        ClientMsg::GotoSlide { index } => control_slide(state, role, name, move |s| s.goto_slide(index)),
 
         ClientMsg::ArchiveRound => match require_host(role) {
             Err(r) => r,
@@ -328,13 +328,30 @@ where
     }
 }
 
-/// Run a host-only carousel move that, on success, broadcasts the slide change.
-fn host_slide<F>(role: Role, state: &mut GameState, f: F) -> Reaction
+/// May this connection move the carousel right now? The host always can; a
+/// player may move only while they are the controller of the current slide.
+fn may_control(state: &GameState, role: Role, name: Option<&str>) -> bool {
+    if role.is_host() {
+        return true;
+    }
+    if role == Role::Player {
+        if let (Some(n), Some(controller)) = (name, state.current_controller()) {
+            return n == controller;
+        }
+    }
+    false
+}
+
+/// Run a carousel move (host or the current reader), broadcasting the change.
+fn control_slide<F>(state: &mut GameState, role: Role, name: Option<&str>, f: F) -> Reaction
 where
     F: FnOnce(&mut GameState) -> Result<usize, TransitionError>,
 {
-    if let Err(r) = require_host(role) {
-        return r;
+    if !may_control(state, role, name) {
+        return Reaction::direct_only(ServerMsg::Error {
+            code: ErrorCode::Forbidden,
+            message: "only the host or the current reader can move the carousel".into(),
+        });
     }
     match f(state) {
         Ok(_) => Reaction {
@@ -620,6 +637,47 @@ mod tests {
         // Roster is locked once submissions are open: no silent add, no broadcast.
         assert!(!state.players.iter().any(|p| p.name == "Latecomer"));
         assert!(r.broadcasts.is_empty());
+    }
+
+    #[test]
+    fn reader_can_advance_their_own_slides() {
+        let (mut state, token) = host_join();
+        state.add_player("Ann").unwrap();
+        state.add_player("Bo").unwrap();
+        state.start_collecting().unwrap();
+        for n in ["Ann", "Bo"] {
+            let idx = state.players.iter().position(|p| p.name == n).unwrap();
+            let id = state.players[idx].prompt_set_id.unwrap();
+            let cnt = state.prompt_set(id).unwrap().prompts.len();
+            state
+                .submit_responses(n, vec!["x".into(); cnt], "s".into())
+                .unwrap();
+        }
+        state.start_game().unwrap(); // slide 0 = rules (host-only)
+
+        let forbidden = |r: &Reaction| {
+            matches!(
+                r.direct.as_slice(),
+                [ServerMsg::Error { code: ErrorCode::Forbidden, .. }]
+            ) && r.broadcasts.is_empty()
+        };
+
+        // On the rules slide a player cannot advance...
+        let r = apply(&mut state, &token, Role::Player, Some("Bo"), ClientMsg::AdvanceSlide);
+        assert!(forbidden(&r));
+        // ...the host moves to slide 1 (Bo's presenter intro)...
+        let r = apply(&mut state, &token, Role::Host, None, ClientMsg::AdvanceSlide);
+        assert!(!r.broadcasts.is_empty());
+        assert_eq!(state.current_controller().as_deref(), Some("Bo"));
+        // ...now Bo (the reader) can advance their own segment...
+        let r = apply(&mut state, &token, Role::Player, Some("Bo"), ClientMsg::AdvanceSlide);
+        assert!(r
+            .broadcasts
+            .iter()
+            .any(|m| matches!(m, ServerMsg::SlideChanged { .. })));
+        // ...but another player cannot move Bo's segment.
+        let r = apply(&mut state, &token, Role::Player, Some("Ann"), ClientMsg::AdvanceSlide);
+        assert!(forbidden(&r));
     }
 
     #[tokio::test]

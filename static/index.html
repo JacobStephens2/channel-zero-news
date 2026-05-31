@@ -131,6 +131,10 @@
   <section class="panel" id="slidePanel">
     <h2>Stage <span id="slideIdx" class="pill">—</span></h2>
     <div id="slide" class="muted">The carousel will appear here once the game starts.</div>
+    <div id="readerControls" class="row hidden" style="margin-top:12px">
+      <button id="rPrev">◀ Prev</button>
+      <button id="rNext" class="primary">Next ▶</button>
+    </div>
   </section>
 
   <!-- log -->
@@ -142,7 +146,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let ws = null, role = "host", myName = null, hostToken = null, lastPrompts = [], assignmentRequested = false;
+let ws = null, role = "host", myName = null, hostToken = null, lastPrompts = [], assignmentRequested = false, amController = false;
 
 function log(dir, obj) {
   const el = $("log");
@@ -193,7 +197,8 @@ $("joinBtn").addEventListener("click", connect);
 
 function connect() {
   if (ws) { ws.close(); ws = null; }
-  lastPrompts = []; assignmentRequested = false;
+  lastPrompts = []; assignmentRequested = false; amController = false;
+  setStage(false); $("readerControls").classList.add("hidden");
   const code = $("code").value.trim().toUpperCase();
   if (!code) { alert("enter a room code"); return; }
   myName = role === "player" ? $("pname").value.trim() : null;
@@ -245,8 +250,12 @@ function renderRoom(room) {
   $("slideIdx").textContent = `${room.current_slide} / ${room.total_slides}`;
   $("progressLine").textContent = `${room.players.length} player(s) · phase: ${room.phase}`;
   renderPlayers(room.players);
-  // Leaving the performance (archived / new round) drops any full-screen stage.
-  if (room.phase !== "performing") setStage(false);
+  // Leaving the performance (archived / new round) drops the stage + controls.
+  if (room.phase !== "performing") {
+    setStage(false);
+    amController = false;
+    $("readerControls").classList.add("hidden");
+  }
 }
 
 function setStage(on) { document.body.classList.toggle("stage-mode", on); }
@@ -307,37 +316,50 @@ function readingBanner(reader) {
   return `<div class="reading-now">🎤 <strong>${escapeHtml(reader)}</strong> is reading…</div>`;
 }
 
+// Who may advance the current slide: the presenter of their own segment
+// (intro → greeting → scripts → sign-off). Mirrors the server's check.
+function controllerOf(s) {
+  switch (s.kind) {
+    case "script": return s.reader;
+    case "greeting":
+    case "signoff":
+    case "presenter_intro": return s.presenter;
+    default: return null;
+  }
+}
+
 function renderSlide(msg) {
   $("slideIdx").textContent = `${msg.index} / ${msg.total_slides}`;
   const s = msg.slide;
   const reader = readerOf(s);
+  const controller = controllerOf(s);
   const content = slideContentHtml(s);
   const el = $("slide");
   el.classList.remove("muted");
+  amController = !!(myName && controller && myName === controller);
 
-  if (role === "player") {
-    if (reader && myName && myName === reader) {
-      // It's this player's turn to read — full-screen teleprompter.
-      el.innerHTML = `<div><div class="badge">YOUR TURN TO READ 🎤</div>${content}</div>`;
-      setStage(true);
-    } else if (reader) {
-      // Someone else is reading — make it clear, don't show the script.
-      el.innerHTML = readingBanner(reader);
-      setStage(false);
-    } else {
-      // Transition / announcement slide (intro, rules, credits): everyone sees it.
-      el.innerHTML = content;
-      setStage(false);
-    }
-  } else if (role === "display") {
-    // Shared screen: announce who's reading (the script lives on their phone).
-    el.innerHTML = reader ? readingBanner(reader) : content;
+  if (role === "display") {
+    // The shared screen is the full-screen teleprompter.
+    el.innerHTML = content;
+    setStage(true);
+  } else if (role === "player") {
     setStage(false);
+    if (amController) {
+      // Your turn: show your lines + your own carousel controls.
+      const badge = reader ? `<div class="badge">YOUR TURN TO READ 🎤</div>` : "";
+      el.innerHTML = `<div>${badge}${content}</div>`;
+    } else if (reader) {
+      el.innerHTML = readingBanner(reader);
+    } else {
+      el.innerHTML = content; // transition / announcement: everyone sees it
+    }
   } else {
-    // Host control panel: follow along with the content + who's up.
+    // Host: follow along with who's reading.
     el.innerHTML = (reader ? `<p class="muted" style="margin:0 0 8px">🎤 ${escapeHtml(reader)} is reading</p>` : "") + content;
     setStage(false);
   }
+  // The reader gets their own Prev/Next while it's their segment.
+  $("readerControls").classList.toggle("hidden", !(role === "player" && amController));
 }
 
 // ---- host control buttons ----
@@ -349,12 +371,17 @@ $("collectBtn").addEventListener("click", () => send({ type: "start_collecting" 
 $("startBtn").addEventListener("click", () => send({ type: "start_game" }));
 $("prevBtn").addEventListener("click", () => send({ type: "prev_slide" }));
 $("nextBtn").addEventListener("click", () => send({ type: "advance_slide" }));
+// Reader's own carousel controls.
+$("rPrev").addEventListener("click", () => send({ type: "prev_slide" }));
+$("rNext").addEventListener("click", () => send({ type: "advance_slide" }));
 $("archiveBtn").addEventListener("click", () => send({ type: "archive_round" }));
 $("newRoundBtn").addEventListener("click", () => send({ type: "new_round" }));
 
 // keyboard: arrows drive the carousel for whoever is host
 document.addEventListener("keydown", (e) => {
-  if (role !== "host" || !ws) return;
+  if (!ws) return;
+  const canDrive = role === "host" || (role === "player" && amController);
+  if (!canDrive) return;
   if (e.key === "ArrowRight") send({ type: "advance_slide" });
   if (e.key === "ArrowLeft") send({ type: "prev_slide" });
 });

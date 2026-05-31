@@ -363,6 +363,19 @@ impl GameState {
         self.build_slides().into_iter().nth(index)
     }
 
+    /// The player allowed to advance the *current* slide: the presenter of their
+    /// own segment (intro → greeting → scripts → sign-off). Transition slides
+    /// (rules / credits / blank) have no controller and are host-only.
+    pub fn current_controller(&self) -> Option<String> {
+        match self.slide_at(self.current_slide)? {
+            Slide::Script { reader, .. } => Some(reader),
+            Slide::Greeting { presenter }
+            | Slide::Signoff { presenter, .. }
+            | Slide::PresenterIntro { presenter, .. } => Some(presenter),
+            Slide::Rules | Slide::Credits | Slide::Blank => None,
+        }
+    }
+
     // ----- archive + reset ----------------------------------------------------
 
     /// Snapshot every player's answers paired with the prompts they answered.
