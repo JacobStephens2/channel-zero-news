@@ -22,7 +22,7 @@ use crate::db::Db;
 use crate::protocol::{
     ClientMsg, ErrorCode, PlayerStatus, Role, RoomSnapshot, ServerMsg,
 };
-use crate::state::{ArchivedEntry, GameState, PromptSet, TransitionError};
+use crate::state::{ArchivedEntry, GameState, Phase, PromptSet, TransitionError};
 
 /// Capacity of a room's command queue.
 const COMMAND_QUEUE: usize = 64;
@@ -248,10 +248,11 @@ pub fn apply(
     }
 }
 
-/// Handle a join: validate the host token, then send the new connection its
-/// initial state (and, for a player, their assignment) directly.
+/// Handle a join: validate the host token, self-register an unknown player, and
+/// send the new connection its initial state (and, for a player, their
+/// assignment) directly.
 fn join(
-    state: &GameState,
+    state: &mut GameState,
     host_token: &str,
     requested: Role,
     join_name: Option<String>,
@@ -262,6 +263,20 @@ fn join(
             code: ErrorCode::Forbidden,
             message: "invalid or missing host token".into(),
         });
+    }
+
+    // Self-registration: a player may join with any name — they don't have to be
+    // pre-entered by the host. If they're not on the roster yet and the room is
+    // still in the lobby, add them automatically. (Once submissions are open the
+    // roster is locked so the partner ring / assignments stay consistent.)
+    let mut self_added = false;
+    if requested == Role::Player {
+        if let Some(n) = join_name.as_deref() {
+            let on_roster = state.players.iter().any(|p| p.name == n);
+            if !on_roster && state.phase == Phase::Lobby && state.add_player(n).is_ok() {
+                self_added = true;
+            }
+        }
     }
 
     let mut direct = vec![
@@ -281,8 +296,15 @@ fn join(
         }
     }
 
+    // If a new player just appeared on the roster, let everyone (host/display) see it.
+    let broadcasts = if self_added {
+        vec![room_state(state), progress(state)]
+    } else {
+        vec![]
+    };
+
     Reaction {
-        broadcasts: vec![],
+        broadcasts,
         direct,
         effects: vec![],
     }
@@ -550,6 +572,54 @@ mod tests {
             .direct
             .iter()
             .any(|m| matches!(m, ServerMsg::Assignment { .. })));
+    }
+
+    #[test]
+    fn player_self_registers_in_lobby() {
+        let (mut state, token) = host_join();
+        let r = apply(
+            &mut state,
+            &token,
+            Role::Player,
+            Some("Zoe"),
+            ClientMsg::JoinRoom {
+                code: "ABCD".into(),
+                role: Role::Player,
+                name: Some("Zoe".into()),
+                token: None,
+            },
+        );
+        // The unknown name was added to the roster...
+        assert!(state.players.iter().any(|p| p.name == "Zoe"));
+        // ...the joiner is acknowledged...
+        assert!(r.direct.iter().any(|m| matches!(m, ServerMsg::Joined { .. })));
+        // ...and host/display screens are told about the new roster.
+        assert!(r
+            .broadcasts
+            .iter()
+            .any(|m| matches!(m, ServerMsg::RoomState { .. })));
+    }
+
+    #[test]
+    fn player_does_not_self_register_after_lobby() {
+        let (mut state, token) = host_join();
+        state.add_player("Ann").unwrap();
+        state.start_collecting().unwrap();
+        let r = apply(
+            &mut state,
+            &token,
+            Role::Player,
+            Some("Latecomer"),
+            ClientMsg::JoinRoom {
+                code: "ABCD".into(),
+                role: Role::Player,
+                name: Some("Latecomer".into()),
+                token: None,
+            },
+        );
+        // Roster is locked once submissions are open: no silent add, no broadcast.
+        assert!(!state.players.iter().any(|p| p.name == "Latecomer"));
+        assert!(r.broadcasts.is_empty());
     }
 
     #[tokio::test]
