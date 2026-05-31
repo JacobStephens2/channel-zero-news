@@ -10,9 +10,12 @@
   body { margin:0; font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); overflow-x:hidden; }
   header { background:var(--accent); color:#fff; padding:10px 16px; font-weight:800; letter-spacing:.5px; display:flex; gap:12px; align-items:center; }
   header .live { font-size:11px; background:#000; padding:2px 8px; border-radius:99px; }
+  header .conn-group { margin-left:auto; display:flex; gap:8px; align-items:center; }
+  #roomPill { background:#0c121d; color:#fff; border-color:rgba(255,255,255,.4); font-weight:700; }
   main { max-width:960px; margin:0 auto; padding:16px; display:grid; gap:16px; grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
   .panel h2 { margin:0 0 10px; font-size:14px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); }
+  .toggle { float:right; background:#0c121d; color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:0 8px; line-height:1.6; cursor:pointer; }
   .full { grid-column:1/3; }
   label { display:block; font-size:12px; color:var(--muted); margin:8px 0 2px; }
   input, textarea, select, button { font:inherit; }
@@ -58,12 +61,24 @@
     flex:1; border:0; background:transparent; font-size:clamp(28px,5vw,64px);
     line-height:1.3; padding:6vw;
   }
+  /* Readable, balanced slide text. The stage and the full-width reader view
+     constrain line length and let names pop. */
+  .stage-content { margin:0 auto; line-height:1.3; text-wrap:balance; }
+  .stage-content strong { color:var(--accent); }
+  body.stage-mode .stage-content { max-width:22ch; }
+  /* When a panel takes the full width (host while performing, or the reader's
+     own turn), make the stage text larger and give it room. */
+  .panel.full #slide { font-size:clamp(22px,3.2vw,40px); min-height:240px; }
+  .panel.full .stage-content { max-width:32ch; }
 </style>
 </head>
 <body>
 <header>
   📺 THE CHANNEL 0 NEWS <span class="live">● REALTIME</span>
-  <span id="conn" class="pill" style="margin-left:auto">disconnected</span>
+  <span class="conn-group">
+    <span id="roomPill" class="pill hidden"></span>
+    <span id="conn" class="pill">disconnected</span>
+  </span>
 </header>
 
 <main>
@@ -114,10 +129,15 @@
 
   <!-- player form -->
   <section class="panel hidden" id="playerPanel">
-    <h2>Your prompts</h2>
+    <h2>Your prompts
+      <span id="submittedTag" class="submitted hidden">✓ submitted</span>
+      <button id="promptsToggle" class="toggle hidden" title="Show / hide your prompts">▾</button>
+    </h2>
     <p id="partnerLine" class="muted">Join to receive your assignment.</p>
-    <div id="promptFields"></div>
-    <button id="submitBtn" class="primary hidden" style="margin-top:10px">Submit responses</button>
+    <div id="promptsBody">
+      <div id="promptFields"></div>
+      <button id="submitBtn" class="primary hidden" style="margin-top:10px">Submit responses</button>
+    </div>
   </section>
 
   <!-- room state -->
@@ -147,7 +167,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let ws = null, role = "host", myName = null, hostToken = null, lastPrompts = [], assignmentRequested = false, amController = false;
-let currentCode = null, autoRestoring = false;
+let currentCode = null, autoRestoring = false, iSubmitted = false, promptsOpen = true, currentPhase = null;
 
 // Persist enough to rejoin after a page refresh (per-tab; the host token is
 // secret so sessionStorage, not localStorage). A refresh re-runs restoreSession()
@@ -220,6 +240,7 @@ $("joinBtn").addEventListener("click", connect);
 function connect() {
   if (ws) { ws.close(); ws = null; }
   lastPrompts = []; assignmentRequested = false; amController = false;
+  iSubmitted = false; promptsOpen = true; currentPhase = null; applyPromptsUI();
   setStage(false); $("readerControls").classList.add("hidden");
   $("slidePanel").classList.remove("full");
   const code = $("code").value.trim().toUpperCase();
@@ -234,7 +255,7 @@ function connect() {
     setConn("connected");
     send({ type: "join_room", code, role, name: myName, token: role === "host" ? hostToken : null });
   };
-  ws.onclose = () => setConn("disconnected");
+  ws.onclose = () => { setConn("disconnected"); $("roomPill").classList.add("hidden"); };
   ws.onerror = () => setConn("error");
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
@@ -246,7 +267,12 @@ function connect() {
 // ---- server event handling (exhaustive) ----
 function handle(msg) {
   switch (msg.type) {
-    case "joined": autoRestoring = false; saveSession(); break;
+    case "joined":
+      autoRestoring = false;
+      saveSession();
+      $("roomPill").textContent = `Room ${currentCode}`;
+      $("roomPill").classList.remove("hidden");
+      break;
     case "assignment": renderAssignment(msg); break;
     case "room_state": renderRoom(msg.room); maybeRequestAssignment(msg.room); break;
     case "submission_progress": renderProgress(msg); break;
@@ -278,21 +304,29 @@ function maybeRequestAssignment(room) {
 }
 
 function renderRoom(room) {
+  currentPhase = room.phase;
   $("phasePill").textContent = room.phase;
   $("slideIdx").textContent = `${room.current_slide} / ${room.total_slides}`;
   $("progressLine").textContent = `${room.players.length} player(s) · phase: ${room.phase}`;
   renderPlayers(room.players);
-  // Give the host's stage the full width while slides are progressing.
-  $("slidePanel").classList.toggle("full", role === "host" && room.phase === "performing");
   // Leaving the performance (archived / new round) drops the stage + controls.
   if (room.phase !== "performing") {
     setStage(false);
     amController = false;
     $("readerControls").classList.add("hidden");
   }
+  updateStageWidth();
 }
 
 function setStage(on) { document.body.classList.toggle("stage-mode", on); }
+
+// The stage panel spans the full width for the host during the show and for the
+// player whose turn it is to read (so their lines are large and easy to read).
+function updateStageWidth() {
+  const wide = currentPhase === "performing" &&
+    (role === "host" || (role === "player" && amController));
+  $("slidePanel").classList.toggle("full", wide);
+}
 function renderProgress(msg) {
   $("progressLine").textContent = `${msg.submitted} / ${msg.total} submitted`;
   renderPlayers(msg.players);
@@ -301,6 +335,24 @@ function renderPlayers(players) {
   $("playerList").innerHTML = players.map(p =>
     `<li><span>${escapeHtml(p.name)}</span>${p.submitted ? '<span class="submitted">✓ submitted</span>' : '<span class="muted">…</span>'}</li>`
   ).join("");
+  // Track whether *this* player has submitted, and collapse their prompt box
+  // the first time they do (they can reopen it with the corner toggle).
+  if (role === "player" && myName) {
+    const me = players.find(p => p.name === myName);
+    const sub = !!(me && me.submitted);
+    if (sub && !iSubmitted) promptsOpen = false; // auto-collapse on submit
+    if (!sub) promptsOpen = true;                // new round: reopen
+    iSubmitted = sub;
+    applyPromptsUI();
+  }
+}
+
+// Reflect the collapse state + show the toggle/tag once submitted.
+function applyPromptsUI() {
+  $("promptsBody").classList.toggle("hidden", !promptsOpen);
+  $("promptsToggle").classList.toggle("hidden", !iSubmitted);
+  $("promptsToggle").textContent = promptsOpen ? "▾" : "▸";
+  $("submittedTag").classList.toggle("hidden", !iSubmitted);
 }
 
 function renderAssignment(msg) {
@@ -310,6 +362,9 @@ function renderAssignment(msg) {
     `<label>${escapeHtml(p) || "Prompt " + (i+1)}</label><textarea data-i="${i}" maxlength="200"></textarea>`
   ).join("") + `<label>…and remember:</label><textarea id="signoff" maxlength="200"></textarea>`;
   $("submitBtn").classList.remove("hidden");
+  // Keep collapsed if we already submitted (e.g. reconnecting); else open.
+  promptsOpen = !iSubmitted;
+  applyPromptsUI();
 }
 
 $("submitBtn").addEventListener("click", () => {
@@ -318,6 +373,9 @@ $("submitBtn").addEventListener("click", () => {
   const signoff = ($("signoff") || {}).value || "";
   send({ type: "submit_responses", responses, signoff });
 });
+
+// Corner toggle to reopen / recollapse the prompt box after submitting.
+$("promptsToggle").addEventListener("click", () => { promptsOpen = !promptsOpen; applyPromptsUI(); });
 
 // The person who reads a given slide aloud (null for non-spoken slides).
 function readerOf(s) {
@@ -364,14 +422,14 @@ function renderSlide(msg) {
 
   if (role === "display") {
     // The shared screen is the full-screen teleprompter.
-    el.innerHTML = content;
+    el.innerHTML = `<div class="stage-content">${content}</div>`;
     setStage(true);
   } else if (role === "player") {
     setStage(false);
     if (amController) {
-      // Your turn: show your lines + your own carousel controls.
+      // Your turn: show your lines (full width) + your own carousel controls.
       const badge = reader ? `<div class="badge">YOUR TURN TO READ 🎤</div>` : "";
-      el.innerHTML = `<div>${badge}${content}</div>`;
+      el.innerHTML = `${badge}<div class="stage-content">${content}</div>`;
     } else if (reader) {
       el.innerHTML = readingBanner(reader);
     } else {
@@ -384,6 +442,7 @@ function renderSlide(msg) {
   }
   // The reader gets their own Prev/Next while it's their segment.
   $("readerControls").classList.toggle("hidden", !(role === "player" && amController));
+  updateStageWidth();
 }
 
 // ---- host control buttons ----
