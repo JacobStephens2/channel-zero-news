@@ -199,6 +199,7 @@ function connect() {
   if (ws) { ws.close(); ws = null; }
   lastPrompts = []; assignmentRequested = false; amController = false;
   setStage(false); $("readerControls").classList.add("hidden");
+  $("slidePanel").classList.remove("full");
   const code = $("code").value.trim().toUpperCase();
   if (!code) { alert("enter a room code"); return; }
   myName = role === "player" ? $("pname").value.trim() : null;
@@ -250,6 +251,8 @@ function renderRoom(room) {
   $("slideIdx").textContent = `${room.current_slide} / ${room.total_slides}`;
   $("progressLine").textContent = `${room.players.length} player(s) · phase: ${room.phase}`;
   renderPlayers(room.players);
+  // Give the host's stage the full width while slides are progressing.
+  $("slidePanel").classList.toggle("full", role === "host" && room.phase === "performing");
   // Leaving the performance (archived / new round) drops the stage + controls.
   if (room.phase !== "performing") {
     setStage(false);
