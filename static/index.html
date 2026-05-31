@@ -31,6 +31,9 @@
   #log { font-family:ui-monospace,Menlo,monospace; font-size:12px; height:200px; overflow:auto; background:#0c121d; border:1px solid var(--line); border-radius:7px; padding:8px; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
   #slide { min-height:160px; display:flex; align-items:center; justify-content:center; text-align:center; font-size:20px; padding:20px; background:#0c121d; border:1px dashed var(--line); border-radius:10px; }
   .muted { color:var(--muted); }
+  .badge { display:inline-block; background:var(--accent); color:#fff; font-weight:800; font-size:14px; letter-spacing:.5px; padding:4px 14px; border-radius:99px; margin-bottom:18px; }
+  .reading-now { font-size:clamp(22px,4vw,40px); line-height:1.3; }
+  .reading-now strong { color:var(--accent); }
   .hidden { display:none; }
   code { background:#0c121d; padding:2px 6px; border-radius:5px; }
   /* Phone widths: one column so the panels aren't cramped, and stack the
@@ -40,6 +43,20 @@
     .full { grid-column:1; }
     .row { flex-direction:column; align-items:stretch; }
     .row > button { width:100%; }
+  }
+  /* Display role during the performance: the slide takes over the whole screen
+     (teleprompter mode). Everything else is hidden. */
+  body.stage-mode header,
+  body.stage-mode main > section:not(#slidePanel) { display:none; }
+  body.stage-mode main { display:block; max-width:none; padding:0; }
+  body.stage-mode #slidePanel {
+    position:fixed; inset:0; z-index:1000; margin:0; border:0; border-radius:0;
+    background:var(--bg); display:flex; flex-direction:column;
+  }
+  body.stage-mode #slidePanel h2 { position:absolute; top:10px; right:14px; margin:0; opacity:.5; }
+  body.stage-mode #slide {
+    flex:1; border:0; background:transparent; font-size:clamp(28px,5vw,64px);
+    line-height:1.3; padding:6vw;
   }
 </style>
 </head>
@@ -228,7 +245,11 @@ function renderRoom(room) {
   $("slideIdx").textContent = `${room.current_slide} / ${room.total_slides}`;
   $("progressLine").textContent = `${room.players.length} player(s) · phase: ${room.phase}`;
   renderPlayers(room.players);
+  // Leaving the performance (archived / new round) drops any full-screen stage.
+  if (room.phase !== "performing") setStage(false);
 }
+
+function setStage(on) { document.body.classList.toggle("stage-mode", on); }
 function renderProgress(msg) {
   $("progressLine").textContent = `${msg.submitted} / ${msg.total} submitted`;
   renderPlayers(msg.players);
@@ -255,26 +276,68 @@ $("submitBtn").addEventListener("click", () => {
   send({ type: "submit_responses", responses, signoff });
 });
 
+// The person who reads a given slide aloud (null for non-spoken slides).
+function readerOf(s) {
+  switch (s.kind) {
+    case "script": return s.reader;
+    case "greeting":
+    case "signoff": return s.presenter;
+    default: return null; // rules / presenter_intro / credits / blank
+  }
+}
+
+// The slide's spoken/announcement content.
+function slideContentHtml(s) {
+  switch (s.kind) {
+    case "rules": return "<div><strong>The rules</strong><br>When it's your turn to read, DO NOT LAUGH.<br>The host advances the slides.</div>";
+    case "presenter_intro":
+      return s.first
+        ? `To start us off, <strong>${escapeHtml(s.presenter)}</strong> presents, with ${escapeHtml(s.teleprompter)} on teleprompter.`
+        : `Next up: <strong>${escapeHtml(s.presenter)}</strong> reads, with ${escapeHtml(s.teleprompter)} on teleprompter.`;
+    case "greeting": return `Good evening! I'm <strong>${escapeHtml(s.presenter)}</strong>, and this is today's Channel 0 News.`;
+    case "script": return escapeHtml(s.text);
+    case "signoff": return `That's all for today. This is ${escapeHtml(s.presenter)} signing off, and remember: ${escapeHtml(s.text)}`;
+    case "credits": return "<strong>Thanks for playing!</strong>";
+    case "blank": return "";
+    default: return "?";
+  }
+}
+
+function readingBanner(reader) {
+  return `<div class="reading-now">🎤 <strong>${escapeHtml(reader)}</strong> is reading…</div>`;
+}
+
 function renderSlide(msg) {
   $("slideIdx").textContent = `${msg.index} / ${msg.total_slides}`;
   const s = msg.slide;
-  let html = "";
-  switch (s.kind) {
-    case "rules": html = "<div><strong>The rules</strong><br>When it's your turn to read, DO NOT LAUGH.<br>Teleprompter operator advances the slides.</div>"; break;
-    case "presenter_intro":
-      html = s.first
-        ? `To start us off, <strong>${escapeHtml(s.presenter)}</strong> presents, with ${escapeHtml(s.teleprompter)} on teleprompter.`
-        : `Next up: <strong>${escapeHtml(s.presenter)}</strong> reads, with ${escapeHtml(s.teleprompter)} on teleprompter.`;
-      break;
-    case "greeting": html = `Good evening! I'm <strong>${escapeHtml(s.presenter)}</strong>, and this is today's Channel 0 News.`; break;
-    case "script": html = escapeHtml(s.text); break;
-    case "signoff": html = `That's all for today. This is ${escapeHtml(s.presenter)} signing off, and remember: ${escapeHtml(s.text)}`; break;
-    case "credits": html = "<strong>Thanks for playing!</strong>"; break;
-    case "blank": html = ""; break;
-    default: html = "?";
+  const reader = readerOf(s);
+  const content = slideContentHtml(s);
+  const el = $("slide");
+  el.classList.remove("muted");
+
+  if (role === "player") {
+    if (reader && myName && myName === reader) {
+      // It's this player's turn to read — full-screen teleprompter.
+      el.innerHTML = `<div><div class="badge">YOUR TURN TO READ 🎤</div>${content}</div>`;
+      setStage(true);
+    } else if (reader) {
+      // Someone else is reading — make it clear, don't show the script.
+      el.innerHTML = readingBanner(reader);
+      setStage(false);
+    } else {
+      // Transition / announcement slide (intro, rules, credits): everyone sees it.
+      el.innerHTML = content;
+      setStage(false);
+    }
+  } else if (role === "display") {
+    // Shared screen: announce who's reading (the script lives on their phone).
+    el.innerHTML = reader ? readingBanner(reader) : content;
+    setStage(false);
+  } else {
+    // Host control panel: follow along with the content + who's up.
+    el.innerHTML = (reader ? `<p class="muted" style="margin:0 0 8px">🎤 ${escapeHtml(reader)} is reading</p>` : "") + content;
+    setStage(false);
   }
-  $("slide").innerHTML = html;
-  $("slide").classList.remove("muted");
 }
 
 // ---- host control buttons ----
