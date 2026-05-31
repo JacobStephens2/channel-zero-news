@@ -57,6 +57,7 @@
     background:var(--bg); display:flex; flex-direction:column;
   }
   body.stage-mode #slidePanel h2 { position:absolute; top:10px; right:14px; margin:0; opacity:.5; }
+  #exitStage { position:absolute; top:10px; left:14px; z-index:1001; background:#0c121d; color:var(--ink); border:1px solid var(--line); border-radius:7px; padding:6px 12px; cursor:pointer; }
   body.stage-mode #slide {
     flex:1; border:0; background:transparent; font-size:clamp(28px,5vw,64px);
     line-height:1.3; padding:6vw;
@@ -149,7 +150,10 @@
 
   <!-- slide / display -->
   <section class="panel" id="slidePanel">
-    <h2>Stage <span id="slideIdx" class="pill">—</span></h2>
+    <button id="exitStage" class="hidden">✕ Exit full screen</button>
+    <h2>Stage <span id="slideIdx" class="pill">—</span>
+      <button id="enterStage" class="toggle hidden" title="Full screen">⛶ Full screen</button>
+    </h2>
     <div id="slide" class="muted">The carousel will appear here once the game starts.</div>
     <div id="readerControls" class="row hidden" style="margin-top:12px">
       <button id="rPrev">◀ Prev</button>
@@ -167,7 +171,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let ws = null, role = "host", myName = null, hostToken = null, lastPrompts = [], assignmentRequested = false, amController = false;
-let currentCode = null, autoRestoring = false, iSubmitted = false, promptsOpen = true, currentPhase = null;
+let currentCode = null, autoRestoring = false, iSubmitted = false, promptsOpen = true, currentPhase = null, stageDismissed = false;
 
 // Persist enough to rejoin after a page refresh (per-tab; the host token is
 // secret so sessionStorage, not localStorage). A refresh re-runs restoreSession()
@@ -240,7 +244,7 @@ $("joinBtn").addEventListener("click", connect);
 function connect() {
   if (ws) { ws.close(); ws = null; }
   lastPrompts = []; assignmentRequested = false; amController = false;
-  iSubmitted = false; promptsOpen = true; currentPhase = null; applyPromptsUI();
+  iSubmitted = false; promptsOpen = true; currentPhase = null; stageDismissed = false; applyPromptsUI();
   setStage(false); $("readerControls").classList.add("hidden");
   $("slidePanel").classList.remove("full");
   const code = $("code").value.trim().toUpperCase();
@@ -313,18 +317,32 @@ function renderRoom(room) {
   if (room.phase !== "performing") {
     setStage(false);
     amController = false;
+    stageDismissed = false; // re-arm full screen for the next performance
     $("readerControls").classList.add("hidden");
   }
   updateStageWidth();
+  updateStageControls();
 }
 
-function setStage(on) { document.body.classList.toggle("stage-mode", on); }
+function setStage(on) { document.body.classList.toggle("stage-mode", on); updateStageControls(); }
+
+// Show the Exit button while in full-screen stage; show the re-enter button for
+// the display once it has dropped out of full screen mid-performance.
+function updateStageControls() {
+  const inStage = document.body.classList.contains("stage-mode");
+  $("exitStage").classList.toggle("hidden", !inStage);
+  $("enterStage").classList.toggle("hidden",
+    !(role === "display" && currentPhase === "performing" && !inStage));
+}
+
+$("exitStage").addEventListener("click", () => { stageDismissed = true; setStage(false); });
+$("enterStage").addEventListener("click", () => { stageDismissed = false; setStage(true); });
 
 // The stage panel spans the full width for the host during the show and for the
 // player whose turn it is to read (so their lines are large and easy to read).
 function updateStageWidth() {
   const wide = currentPhase === "performing" &&
-    (role === "host" || (role === "player" && amController));
+    (role === "host" || role === "display" || (role === "player" && amController));
   $("slidePanel").classList.toggle("full", wide);
 }
 function renderProgress(msg) {
@@ -421,9 +439,9 @@ function renderSlide(msg) {
   amController = !!(myName && controller && myName === controller);
 
   if (role === "display") {
-    // The shared screen is the full-screen teleprompter.
+    // The shared screen is the full-screen teleprompter (unless exited).
     el.innerHTML = `<div class="stage-content">${content}</div>`;
-    setStage(true);
+    setStage(!stageDismissed);
   } else if (role === "player") {
     setStage(false);
     if (amController) {
