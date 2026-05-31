@@ -288,12 +288,19 @@ fn join(
         progress(state),
     ];
 
-    if requested == Role::Player {
+    // While collecting, a player gets their partner + prompts to fill in.
+    if requested == Role::Player && state.phase == Phase::Collecting {
         if let Some(n) = join_name.as_deref() {
             if let Some(assignment) = assignment(state, n) {
                 direct.push(assignment);
             }
         }
+    }
+
+    // Reconnecting (or joining) mid-performance: send the current slide so the
+    // client can render the stage immediately, not just on the next move.
+    if state.phase == Phase::Performing {
+        direct.push(slide_changed(state));
     }
 
     // If a new player just appeared on the roster, let everyone (host/display) see it.

@@ -147,6 +147,28 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let ws = null, role = "host", myName = null, hostToken = null, lastPrompts = [], assignmentRequested = false, amController = false;
+let currentCode = null, autoRestoring = false;
+
+// Persist enough to rejoin after a page refresh (per-tab; the host token is
+// secret so sessionStorage, not localStorage). A refresh re-runs restoreSession()
+// which reconnects to the same room/role/name and the server replays the state.
+const SESSION_KEY = "cz_session";
+function saveSession() {
+  try { sessionStorage.setItem(SESSION_KEY, JSON.stringify({ code: currentCode, role, name: myName, hostToken })); } catch (e) {}
+}
+function clearSession() { try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {} }
+function restoreSession() {
+  let s = null;
+  try { s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null"); } catch (e) {}
+  if (!s || !s.code) return;
+  $("role").value = s.role;
+  $("code").value = s.code;
+  if (s.name) $("pname").value = s.name;
+  hostToken = s.hostToken || null;
+  applyRoleUI();
+  autoRestoring = true;
+  connect();
+}
 
 function log(dir, obj) {
   const el = $("log");
@@ -204,6 +226,7 @@ function connect() {
   if (!code) { alert("enter a room code"); return; }
   myName = role === "player" ? $("pname").value.trim() : null;
   if (role === "player" && !myName) { alert("enter your name"); return; }
+  currentCode = code;
 
   ws = new WebSocket(wsUrl());
   setConn("connecting…");
@@ -223,14 +246,22 @@ function connect() {
 // ---- server event handling (exhaustive) ----
 function handle(msg) {
   switch (msg.type) {
-    case "joined": break;
+    case "joined": autoRestoring = false; saveSession(); break;
     case "assignment": renderAssignment(msg); break;
     case "room_state": renderRoom(msg.room); maybeRequestAssignment(msg.room); break;
     case "submission_progress": renderProgress(msg); break;
     case "game_started": $("slideIdx").textContent = `0 / ${msg.total_slides}`; break;
     case "slide_changed": renderSlide(msg); break;
     case "pong": break;
-    case "error": alert(`${msg.code}: ${msg.message}`); break;
+    case "error":
+      // A saved room that no longer exists (e.g. server restarted): drop the
+      // stale session silently if we were auto-reconnecting.
+      if (msg.code === "unknown_room") {
+        clearSession();
+        if (autoRestoring) { autoRestoring = false; break; }
+      }
+      alert(`${msg.code}: ${msg.message}`);
+      break;
     default: console.warn("unknown server message", msg);
   }
 }
@@ -382,6 +413,7 @@ document.addEventListener("keydown", (e) => {
 function escapeHtml(s) { return (s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
 
 applyRoleUI();
+restoreSession();
 </script>
 </body>
 </html>
