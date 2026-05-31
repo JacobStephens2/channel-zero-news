@@ -117,7 +117,7 @@
   </section>
 
   <!-- log -->
-  <section class="panel full">
+  <section class="panel full" id="logPanel">
     <h2>Event log (everything the server pushes)</h2>
     <div id="log"></div>
   </section>
@@ -153,6 +153,8 @@ function applyRoleUI() {
   // code is used at creation (the server always assigns a fresh unique code).
   $("codeField").classList.toggle("hidden", role === "host");
   $("joinBtn").classList.toggle("hidden", role === "host");
+  // The raw event log is a debug aid for host/display; hide it from players.
+  $("logPanel").classList.toggle("hidden", role === "player");
 }
 $("role").addEventListener("change", applyRoleUI);
 
