@@ -5,6 +5,14 @@ multiplayer backend in **Rust (Axum + WebSockets)**. The game flow is preserved
 exactly; the transport moved from HTTP polling to authoritative server state
 broadcast over WebSockets.
 
+
+## History
+
+This is a **re-platform** of the original PHP/MySQL app (HTTP polling) into a
+push-based realtime backend. The historical source is archived at
+[channel-zero-news-php](https://github.com/JacobStephens2/channel-zero-news-php).
+Live game: [zero.stephens.page](https://zero.stephens.page).
+
 ## The game
 
 A host enters participant names and opens submissions. Each player picks their
