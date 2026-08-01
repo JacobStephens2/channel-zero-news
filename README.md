@@ -11,7 +11,7 @@ broadcast over WebSockets.
 This is a **re-platform** of the original PHP/MySQL app (HTTP polling) into a
 push-based realtime backend. The historical source is archived at
 [channel-zero-news-php](https://github.com/JacobStephens2/channel-zero-news-php).
-Live game: [zero.stephens.page](https://zero.stephens.page).
+Live game: [channelzeronews.app](https://channelzeronews.app).
 
 ## The game
 
