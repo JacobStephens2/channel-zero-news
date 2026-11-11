@@ -111,6 +111,21 @@ cargo test --test persistence # DB-backed persistence (skipped if no DATABASE_UR
 cargo run                     # serves on 0.0.0.0:3471
 ```
 
+Client connection and entry-wiring tests use Node 22 or newer, with no package
+manager or client build step:
+
+```bash
+node --experimental-vm-modules --test tests/*.test.mjs
+cargo test --locked
+```
+
+The VM modules flag lets the wiring harness execute the actual inline client
+module and its imports against controlled browser adapters. Session tests drive
+the public `connect`, `restore`, `send`, and read-only `current` interface in
+`static/room-session.mjs`. The existing static router serves that module directly;
+`tests/full_flow.rs` checks its URL and JavaScript content type. The database
+test skips its DB assertions when `DATABASE_URL` is unset.
+
 ### Database setup (Postgres)
 
 ```bash

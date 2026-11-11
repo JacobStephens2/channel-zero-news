@@ -34,6 +34,37 @@ async fn spawn_server() -> String {
     format!("{addr}")
 }
 
+#[tokio::test]
+async fn client_session_module_is_served_without_a_build_step() {
+    let addr = spawn_server().await;
+    let http = reqwest::Client::new();
+    let index = http
+        .get(format!("http://{addr}/"))
+        .send()
+        .await
+        .unwrap();
+    assert!(index.status().is_success());
+    let html = index.text().await.unwrap();
+    assert!(html.contains("<script type=\"module\">"));
+    assert!(html.contains("from \"./room-session.mjs\""));
+
+    let module = http
+        .get(format!("http://{addr}/room-session.mjs"))
+        .send()
+        .await
+        .unwrap();
+    assert!(module.status().is_success());
+    let content_type = module.headers()["content-type"].to_str().unwrap();
+    assert!(
+        content_type.starts_with("text/javascript")
+            || content_type.starts_with("application/javascript")
+    );
+    assert_eq!(
+        module.text().await.unwrap(),
+        include_str!("../static/room-session.mjs")
+    );
+}
+
 async fn send(ws: &mut Ws, msg: &ClientMsg) {
     ws.send(Message::Text(serde_json::to_string(msg).unwrap()))
         .await

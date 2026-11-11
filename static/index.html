@@ -169,31 +169,25 @@
   </section>
 </main>
 
-<script>
-const $ = (id) => document.getElementById(id);
-let ws = null, role = "host", myName = null, hostToken = null, lastPrompts = [], assignmentRequested = false, amController = false;
-let currentCode = null, autoRestoring = false, iSubmitted = false, promptsOpen = true, currentPhase = null, stageDismissed = false;
+<script type="module">
+import { createRoomSession } from "./room-session.mjs";
 
-// Persist enough to rejoin after a page refresh (per-tab; the host token is
-// secret so sessionStorage, not localStorage). A refresh re-runs restoreSession()
-// which reconnects to the same room/role/name and the server replays the state.
-const SESSION_KEY = "cz_session";
-function saveSession() {
-  try { sessionStorage.setItem(SESSION_KEY, JSON.stringify({ code: currentCode, role, name: myName, hostToken })); } catch (e) {}
-}
-function clearSession() { try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {} }
-function restoreSession() {
-  let s = null;
-  try { s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null"); } catch (e) {}
-  if (!s || !s.code) return;
-  $("role").value = s.role;
-  $("code").value = s.code;
-  if (s.name) $("pname").value = s.name;
-  hostToken = s.hostToken || null;
-  applyRoleUI();
-  autoRestoring = true;
-  connect();
-}
+const $ = (id) => document.getElementById(id);
+let lastPrompts = [], assignmentRequested = false, amController = false;
+let iSubmitted = false, promptsOpen = true, currentPhase = null, stageDismissed = false;
+
+const session = createRoomSession({
+  createSocket: () => new WebSocket(wsUrl()),
+  storage: {
+    getItem: (key) => sessionStorage.getItem(key),
+    setItem: (key, value) => sessionStorage.setItem(key, value),
+    removeItem: (key) => sessionStorage.removeItem(key),
+  },
+  onChange: renderSession,
+  onMessage: (message) => { log("←", message); handle(message); },
+  onError: (message) => { log("!", message); alert(message); },
+  onSend: (message) => log("→", message),
+});
 
 function log(dir, obj) {
   const el = $("log");
@@ -201,8 +195,6 @@ function log(dir, obj) {
   el.textContent += `${t} ${dir} ${JSON.stringify(obj)}\n`;
   el.scrollTop = el.scrollHeight;
 }
-function send(msg) { if (ws && ws.readyState === 1) { ws.send(JSON.stringify(msg)); log("→", msg); } }
-function setConn(s) { $("conn").textContent = s; }
 
 function wsUrl() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -211,16 +203,17 @@ function wsUrl() {
 
 // ---- role UI toggling ----
 function applyRoleUI() {
-  role = $("role").value;
-  $("nameField").classList.toggle("hidden", role !== "player");
-  $("createBtn").classList.toggle("hidden", role !== "host");
+  const pendingRole = $("role").value;
+  const role = session.current.role || pendingRole;
+  $("nameField").classList.toggle("hidden", pendingRole !== "player");
+  $("createBtn").classList.toggle("hidden", pendingRole !== "host");
   $("hostPanel").classList.toggle("hidden", role !== "host");
   $("playerPanel").classList.toggle("hidden", role !== "player");
   // The host creates a room and is *given* a code; only players/display type
   // one in to join. Hiding the code input avoids the impression that a typed
   // code is used at creation (the server always assigns a fresh unique code).
-  $("codeField").classList.toggle("hidden", role === "host");
-  $("joinBtn").classList.toggle("hidden", role === "host");
+  $("codeField").classList.toggle("hidden", pendingRole === "host");
+  $("joinBtn").classList.toggle("hidden", pendingRole === "host");
   // The raw event log is a debug aid for host/display; hide it from players.
   $("logPanel").classList.toggle("hidden", role === "player");
 }
@@ -231,53 +224,45 @@ $("createBtn").addEventListener("click", async () => {
   const res = await fetch("/api/rooms", { method: "POST" });
   if (!res.ok) { alert("create failed"); return; }
   const data = await res.json();
-  hostToken = data.host_token;
   $("code").value = data.code;
   $("hostCreds").classList.remove("hidden");
   $("hostCreds").innerHTML = `Room <code>${data.code}</code> created. Players join with this code. Host token held in this tab.`;
   log("REST", { created: data.code });
-  connect();
+  session.connect({ code: data.code, role: "host", hostToken: data.host_token });
 });
 
 // ---- connect / join ----
-$("joinBtn").addEventListener("click", connect);
+$("joinBtn").addEventListener("click", () => session.connect({
+  code: $("code").value, role: $("role").value, name: $("pname").value,
+}));
 
-function connect() {
-  if (ws) { ws.close(); ws = null; }
-  lastPrompts = []; assignmentRequested = false; amController = false;
-  iSubmitted = false; promptsOpen = true; currentPhase = null; stageDismissed = false; applyPromptsUI();
-  setStage(false); $("readerControls").classList.add("hidden");
-  $("slidePanel").classList.remove("full");
-  const code = $("code").value.trim().toUpperCase();
-  if (!code) { alert("enter a room code"); return; }
-  myName = role === "player" ? $("pname").value.trim() : null;
-  if (role === "player" && !myName) { alert("enter your name"); return; }
-  currentCode = code;
-
-  ws = new WebSocket(wsUrl());
-  setConn("connecting…");
-  ws.onopen = () => {
-    setConn("connected");
-    send({ type: "join_room", code, role, name: myName, token: role === "host" ? hostToken : null });
-  };
-  ws.onclose = () => { setConn("disconnected"); $("roomPill").classList.add("hidden"); };
-  ws.onerror = () => setConn("error");
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    log("←", msg);
-    handle(msg);
-  };
+function renderSession(view) {
+  $("conn").textContent = ({ connecting: "connecting…", awaiting_joined: "joining…",
+    joined: "connected", failed: "error", disconnected: "disconnected" })[view.state];
+  $("roomPill").textContent = view.code ? `Room ${view.code}` : "";
+  $("roomPill").classList.toggle("hidden", view.state !== "joined");
+  if (view.state === "connecting") {
+    lastPrompts = []; assignmentRequested = false; amController = false;
+    iSubmitted = false; promptsOpen = true; currentPhase = null; stageDismissed = false;
+    applyPromptsUI(); setStage(false);
+    $("readerControls").classList.add("hidden");
+    $("slidePanel").classList.remove("full");
+    $("promptFields").innerHTML = "";
+    $("submitBtn").classList.add("hidden");
+    $("partnerLine").textContent = "Join to receive your assignment.";
+    $("phasePill").textContent = "—";
+    $("progressLine").textContent = "Joining room…";
+    $("playerList").innerHTML = "";
+    $("slideIdx").textContent = "—";
+    $("slide").textContent = "The carousel will appear here once the game starts.";
+    $("slide").classList.add("muted");
+  }
+  applyRoleUI();
 }
 
 // ---- server event handling (exhaustive) ----
 function handle(msg) {
   switch (msg.type) {
-    case "joined":
-      autoRestoring = false;
-      saveSession();
-      $("roomPill").textContent = `Room ${currentCode}`;
-      $("roomPill").classList.remove("hidden");
-      break;
     case "assignment": renderAssignment(msg); break;
     case "room_state": renderRoom(msg.room); maybeRequestAssignment(msg.room); break;
     case "submission_progress": renderProgress(msg); break;
@@ -285,12 +270,6 @@ function handle(msg) {
     case "slide_changed": renderSlide(msg); break;
     case "pong": break;
     case "error":
-      // A saved room that no longer exists (e.g. server restarted): drop the
-      // stale session silently if we were auto-reconnecting.
-      if (msg.code === "unknown_room") {
-        clearSession();
-        if (autoRestoring) { autoRestoring = false; break; }
-      }
       alert(`${msg.code}: ${msg.message}`);
       break;
     default: console.warn("unknown server message", msg);
@@ -302,9 +281,8 @@ function handle(msg) {
 // the server just replies with this player's partner + prompts). One-shot per
 // connection so it can't loop.
 function maybeRequestAssignment(room) {
-  if (role === "player" && room.phase === "collecting" && lastPrompts.length === 0 && !assignmentRequested) {
-    assignmentRequested = true;
-    send({ type: "join_room", code: room.code, role: "player", name: myName });
+  if (session.current.role === "player" && room.phase === "collecting" && lastPrompts.length === 0 && !assignmentRequested) {
+    assignmentRequested = session.send({ type: "join_room" });
   }
 }
 
@@ -350,7 +328,7 @@ function updateStageControls() {
   const inStage = document.body.classList.contains("stage-mode");
   $("exitStage").classList.toggle("hidden", !inStage);
   $("enterStage").classList.toggle("hidden",
-    !(role === "display" && currentPhase === "performing" && !inStage));
+    !(session.current.role === "display" && currentPhase === "performing" && !inStage));
 }
 
 $("exitStage").addEventListener("click", () => { stageDismissed = true; setStage(false); });
@@ -359,6 +337,7 @@ $("enterStage").addEventListener("click", () => { stageDismissed = false; setSta
 // The stage panel spans the full width for the host during the show and for the
 // player whose turn it is to read (so their lines are large and easy to read).
 function updateStageWidth() {
+  const { role } = session.current;
   const wide = currentPhase === "performing" &&
     (role === "host" || role === "display" || (role === "player" && amController));
   $("slidePanel").classList.toggle("full", wide);
@@ -368,6 +347,7 @@ function renderProgress(msg) {
   renderPlayers(msg.players);
 }
 function renderPlayers(players) {
+  const { role, name: myName } = session.current;
   $("playerList").innerHTML = players.map(p =>
     `<li><span>${escapeHtml(p.name)}</span>${p.submitted ? '<span class="submitted">✓ submitted</span>' : '<span class="muted">…</span>'}</li>`
   ).join("");
@@ -407,7 +387,7 @@ $("submitBtn").addEventListener("click", () => {
   const responses = [...document.querySelectorAll("#promptFields textarea[data-i]")]
     .sort((a, b) => a.dataset.i - b.dataset.i).map(t => t.value);
   const signoff = ($("signoff") || {}).value || "";
-  send({ type: "submit_responses", responses, signoff });
+  session.send({ type: "submit_responses", responses, signoff });
 });
 
 // Corner toggle to reopen / recollapse the prompt box after submitting.
@@ -445,6 +425,7 @@ function readingBanner(reader) {
 }
 
 function renderSlide(msg) {
+  const { role, name: myName } = session.current;
   $("slideIdx").textContent = `${msg.index} / ${msg.total_slides}`;
   const s = msg.slide;
   const reader = readerOf(s);
@@ -484,31 +465,35 @@ function renderSlide(msg) {
 // ---- host control buttons ----
 $("addBtn").addEventListener("click", () => {
   const name = $("newPlayer").value.trim();
-  if (name) { send({ type: "add_player", name }); $("newPlayer").value = ""; }
+  if (name) { session.send({ type: "add_player", name }); $("newPlayer").value = ""; }
 });
-$("collectBtn").addEventListener("click", () => send({ type: "start_collecting" }));
-$("startBtn").addEventListener("click", () => send({ type: "start_game" }));
-$("prevBtn").addEventListener("click", () => send({ type: "prev_slide" }));
-$("nextBtn").addEventListener("click", () => send({ type: "advance_slide" }));
+$("collectBtn").addEventListener("click", () => session.send({ type: "start_collecting" }));
+$("startBtn").addEventListener("click", () => session.send({ type: "start_game" }));
+$("prevBtn").addEventListener("click", () => session.send({ type: "prev_slide" }));
+$("nextBtn").addEventListener("click", () => session.send({ type: "advance_slide" }));
 // Reader's own carousel controls.
-$("rPrev").addEventListener("click", () => send({ type: "prev_slide" }));
-$("rNext").addEventListener("click", () => send({ type: "advance_slide" }));
-$("archiveBtn").addEventListener("click", () => send({ type: "archive_round" }));
-$("newRoundBtn").addEventListener("click", () => send({ type: "new_round" }));
+$("rPrev").addEventListener("click", () => session.send({ type: "prev_slide" }));
+$("rNext").addEventListener("click", () => session.send({ type: "advance_slide" }));
+$("archiveBtn").addEventListener("click", () => session.send({ type: "archive_round" }));
+$("newRoundBtn").addEventListener("click", () => session.send({ type: "new_round" }));
 
 // keyboard: arrows drive the carousel for whoever is host
 document.addEventListener("keydown", (e) => {
-  if (!ws) return;
+  const { role } = session.current;
   const canDrive = role === "host" || (role === "player" && amController);
   if (!canDrive) return;
-  if (e.key === "ArrowRight") send({ type: "advance_slide" });
-  if (e.key === "ArrowLeft") send({ type: "prev_slide" });
+  if (e.key === "ArrowRight") session.send({ type: "advance_slide" });
+  if (e.key === "ArrowLeft") session.send({ type: "prev_slide" });
 });
 
 function escapeHtml(s) { return (s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
 
 applyRoleUI();
-restoreSession();
+if (session.restore()) {
+  const { code, role, name } = session.current;
+  $("role").value = role; $("code").value = code; $("pname").value = name || "";
+  applyRoleUI();
+}
 </script>
 </body>
 </html>
