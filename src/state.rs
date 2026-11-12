@@ -18,6 +18,17 @@ use serde::{Deserialize, Serialize};
 /// Maximum number of prompts in a prompt set (mirrors `tblPrompts.prompt1..7`).
 pub const MAX_PROMPTS: usize = 7;
 
+/// Maximum characters in a lobby player name. Counted as Unicode scalar
+/// values, the same unit as the client's text-field character limit.
+pub const MAX_PLAYER_NAME_CHARS: usize = 200;
+
+/// Maximum players on one room's roster.
+pub const MAX_ROSTER_PLAYERS: usize = 64;
+
+/// Maximum characters in one submitted response or the sign-off. Matches the
+/// client `maxlength="200"` on those fields. Counted as Unicode scalar values.
+pub const MAX_SUBMISSION_CHARS: usize = 200;
+
 /// Who reads/controls a given slide, if anyone (the presenter of that segment).
 fn slide_controller(slide: &Slide) -> Option<String> {
     match slide {
@@ -140,6 +151,14 @@ pub enum TransitionError {
     UnknownPlayer(String),
     #[error("a player named '{0}' is already in this room")]
     DuplicatePlayer(String),
+    #[error("player name is longer than {MAX_PLAYER_NAME_CHARS} characters")]
+    NameTooLong,
+    #[error("the roster is limited to {MAX_ROSTER_PLAYERS} players")]
+    RosterFull,
+    #[error("a response is longer than {MAX_SUBMISSION_CHARS} characters")]
+    ResponseTooLong,
+    #[error("sign-off is longer than {MAX_SUBMISSION_CHARS} characters")]
+    SignoffTooLong,
     #[error("not every player has submitted yet")]
     NotAllSubmitted,
     #[error("slide index {0} is out of range")]
@@ -192,12 +211,20 @@ impl GameState {
     // ----- roster management (Lobby only) -------------------------------------
 
     /// Add a player to the roster. Allowed only while in the Lobby so that the
-    /// roster — and therefore the partner ring and assignments — is fixed once
-    /// submissions open.
+    /// roster, and therefore the partner ring and assignments, is fixed once
+    /// submissions open. The name is capped at [`MAX_PLAYER_NAME_CHARS`] and
+    /// the roster at [`MAX_ROSTER_PLAYERS`]; host adds and player joins both
+    /// come through here.
     pub fn add_player(&mut self, name: &str) -> Result<(), TransitionError> {
         self.require_phase(Phase::Lobby)?;
+        if name.chars().count() > MAX_PLAYER_NAME_CHARS {
+            return Err(TransitionError::NameTooLong);
+        }
         if self.player_index(name).is_some() {
             return Err(TransitionError::DuplicatePlayer(name.to_string()));
+        }
+        if self.players.len() >= MAX_ROSTER_PLAYERS {
+            return Err(TransitionError::RosterFull);
         }
         self.players.push(Player::new(name));
         Ok(())
@@ -244,7 +271,8 @@ impl GameState {
     // ----- submissions (Collecting) -------------------------------------------
 
     /// Record a player's responses. The number of response items must match the
-    /// number of prompts in their assigned set.
+    /// number of prompts in their assigned set. Each response and the sign-off
+    /// are capped at [`MAX_SUBMISSION_CHARS`].
     pub fn submit_responses(
         &mut self,
         name: &str,
@@ -268,6 +296,15 @@ impl GameState {
                 expected,
                 got: items.len(),
             });
+        }
+        if items
+            .iter()
+            .any(|item| item.chars().count() > MAX_SUBMISSION_CHARS)
+        {
+            return Err(TransitionError::ResponseTooLong);
+        }
+        if signoff.chars().count() > MAX_SUBMISSION_CHARS {
+            return Err(TransitionError::SignoffTooLong);
         }
 
         self.players[idx].responses = Some(Responses { items, signoff });
@@ -479,6 +516,34 @@ mod tests {
     }
 
     #[test]
+    fn add_player_caps_a_name_at_200_characters() {
+        let mut g = GameState::new("ABCD", sets());
+        let at_limit = "é".repeat(200);
+        g.add_player(&at_limit).unwrap();
+        assert_eq!(g.players[0].name, at_limit);
+
+        let too_long = "é".repeat(201);
+        assert_eq!(g.add_player(&too_long), Err(TransitionError::NameTooLong));
+        assert_eq!(g.players.len(), 1);
+    }
+
+    #[test]
+    fn add_player_caps_the_roster_at_64_players() {
+        let mut g = GameState::new("ABCD", sets());
+        for i in 0..64 {
+            g.add_player(&format!("p{i}")).unwrap();
+        }
+        assert_eq!(g.players.len(), 64);
+        assert_eq!(g.add_player("one-more"), Err(TransitionError::RosterFull));
+        assert_eq!(g.players.len(), 64);
+        // Someone already on a full roster is a duplicate, not a new seat.
+        assert_eq!(
+            g.add_player("p0"),
+            Err(TransitionError::DuplicatePlayer("p0".into()))
+        );
+    }
+
+    #[test]
     fn cannot_add_player_outside_lobby() {
         let mut g = lobby_with(&["Ann", "Bo"]);
         g.start_collecting().unwrap();
@@ -555,6 +620,41 @@ mod tests {
                 got: 1
             }
         );
+    }
+
+    #[test]
+    fn submit_caps_each_response_at_200_characters() {
+        let mut g = lobby_with(&["Ann", "Bo"]);
+        g.start_collecting().unwrap();
+        let at_limit = "é".repeat(200);
+        g.submit_responses("Bo", vec![at_limit.clone(), "fine".into()], "sign".into())
+            .unwrap();
+        assert_eq!(
+            g.players[1].responses.as_ref().unwrap().items,
+            vec![at_limit, "fine".to_string()]
+        );
+
+        let err = g
+            .submit_responses("Ann", vec!["fine".into(), "é".repeat(201)], "sign".into())
+            .unwrap_err();
+        assert_eq!(err, TransitionError::ResponseTooLong);
+        assert!(g.players[0].responses.is_none());
+    }
+
+    #[test]
+    fn submit_caps_the_signoff_at_200_characters() {
+        let mut g = lobby_with(&["Ann", "Bo"]);
+        g.start_collecting().unwrap();
+        let at_limit = "é".repeat(200);
+        g.submit_responses("Bo", vec!["fine".into(), "fine".into()], at_limit.clone())
+            .unwrap();
+        assert_eq!(g.players[1].responses.as_ref().unwrap().signoff, at_limit);
+
+        let err = g
+            .submit_responses("Ann", vec!["fine".into(), "fine".into()], "é".repeat(201))
+            .unwrap_err();
+        assert_eq!(err, TransitionError::SignoffTooLong);
+        assert!(g.players[0].responses.is_none());
     }
 
     #[test]

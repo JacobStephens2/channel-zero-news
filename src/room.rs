@@ -265,16 +265,22 @@ fn join(
         });
     }
 
-    // Self-registration: a player may join with any name — they don't have to be
-    // pre-entered by the host. If they're not on the roster yet and the room is
-    // still in the lobby, add them automatically. (Once submissions are open the
-    // roster is locked so the partner ring / assignments stay consistent.)
+    // Self-registration: a player who is not on the roster yet is added while
+    // the room is still in the lobby. `add_player` enforces the shared
+    // name-length and roster-size limits; if it rejects that new name, the
+    // join returns that error instead of succeeding. Joining a name already
+    // on the roster, or any join that does not add a name, stays a normal
+    // join. Once submissions are open the roster stays locked so the partner
+    // ring and assignments stay consistent.
     let mut self_added = false;
     if requested == Role::Player {
         if let Some(n) = join_name.as_deref() {
             let on_roster = state.players.iter().any(|p| p.name == n);
-            if !on_roster && state.phase == Phase::Lobby && state.add_player(n).is_ok() {
-                self_added = true;
+            if !on_roster && state.phase == Phase::Lobby {
+                match state.add_player(n) {
+                    Ok(()) => self_added = true,
+                    Err(e) => return Reaction::direct_only(transition_error(e)),
+                }
             }
         }
     }
@@ -482,7 +488,7 @@ fn transition_error(e: TransitionError) -> ServerMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{Phase, PromptSet};
+    use crate::state::{Phase, PromptSet, TransitionError};
 
     fn sets() -> Vec<PromptSet> {
         vec![PromptSet {
@@ -623,6 +629,228 @@ mod tests {
             .broadcasts
             .iter()
             .any(|m| matches!(m, ServerMsg::RoomState { .. })));
+    }
+
+    #[test]
+    fn player_join_returns_add_player_rejection_for_a_new_lobby_name() {
+        let (mut state, token) = host_join();
+        let name = "é".repeat(201);
+        let r = apply(
+            &mut state,
+            &token,
+            Role::Player,
+            Some(&name),
+            ClientMsg::JoinRoom {
+                code: "ABCD".into(),
+                role: Role::Player,
+                name: Some(name.clone()),
+                token: None,
+            },
+        );
+        assert!(state.players.is_empty());
+        assert!(r.broadcasts.is_empty());
+        assert_eq!(
+            r.direct,
+            vec![ServerMsg::Error {
+                code: ErrorCode::InvalidTransition,
+                message: TransitionError::NameTooLong.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn player_join_returns_roster_full_for_a_new_lobby_name() {
+        let (mut state, token) = host_join();
+        for i in 0..64 {
+            state.add_player(&format!("p{i}")).unwrap();
+        }
+        let r = apply(
+            &mut state,
+            &token,
+            Role::Player,
+            Some("newbie"),
+            ClientMsg::JoinRoom {
+                code: "ABCD".into(),
+                role: Role::Player,
+                name: Some("newbie".into()),
+                token: None,
+            },
+        );
+        assert_eq!(state.players.len(), 64);
+        assert!(!state.players.iter().any(|p| p.name == "newbie"));
+        assert!(r.broadcasts.is_empty());
+        assert_eq!(
+            r.direct,
+            vec![ServerMsg::Error {
+                code: ErrorCode::InvalidTransition,
+                message: TransitionError::RosterFull.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn player_join_of_an_existing_name_stays_successful_on_a_full_roster() {
+        let (mut state, token) = host_join();
+        for i in 0..64 {
+            state.add_player(&format!("p{i}")).unwrap();
+        }
+        let r = apply(
+            &mut state,
+            &token,
+            Role::Player,
+            Some("p0"),
+            ClientMsg::JoinRoom {
+                code: "ABCD".into(),
+                role: Role::Player,
+                name: Some("p0".into()),
+                token: None,
+            },
+        );
+        assert_eq!(state.players.len(), 64);
+        assert!(r.broadcasts.is_empty());
+        assert!(matches!(
+            r.direct.first(),
+            Some(ServerMsg::Joined {
+                role: Role::Player,
+                name: Some(joined),
+            }) if joined == "p0"
+        ));
+    }
+
+    #[test]
+    fn player_join_that_does_not_add_a_name_stays_successful() {
+        let (mut state, token) = host_join();
+        state.add_player("Ann").unwrap();
+        state.start_collecting().unwrap();
+        let name = "é".repeat(201);
+        let before = state.players.len();
+        let r = apply(
+            &mut state,
+            &token,
+            Role::Player,
+            Some(&name),
+            ClientMsg::JoinRoom {
+                code: "ABCD".into(),
+                role: Role::Player,
+                name: Some(name.clone()),
+                token: None,
+            },
+        );
+        // Roster is locked, so a name `add_player` would reject still joins
+        // without being added and without an error.
+        assert_eq!(state.players.len(), before);
+        assert!(!state.players.iter().any(|p| p.name == name));
+        assert!(r.broadcasts.is_empty());
+        assert!(matches!(
+            r.direct.first(),
+            Some(ServerMsg::Joined {
+                role: Role::Player,
+                name: Some(joined),
+            }) if joined == &name
+        ));
+    }
+
+    #[test]
+    fn host_add_player_rejects_a_name_over_200_characters() {
+        let (mut state, token) = host_join();
+        let r = apply(
+            &mut state,
+            &token,
+            Role::Host,
+            None,
+            ClientMsg::AddPlayer {
+                name: "é".repeat(201),
+            },
+        );
+        assert!(state.players.is_empty());
+        assert!(r.broadcasts.is_empty());
+        assert_eq!(
+            r.direct,
+            vec![ServerMsg::Error {
+                code: ErrorCode::InvalidTransition,
+                message: TransitionError::NameTooLong.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn player_submit_rejects_a_response_over_200_characters() {
+        let (mut state, token) = host_join();
+        state.add_player("Ann").unwrap();
+        state.add_player("Bo").unwrap();
+        state.start_collecting().unwrap();
+        let r = apply(
+            &mut state,
+            &token,
+            Role::Player,
+            Some("Ann"),
+            ClientMsg::SubmitResponses {
+                responses: vec!["fine".into(), "é".repeat(201)],
+                signoff: "sign".into(),
+            },
+        );
+        assert!(state.players.iter().all(|p| p.responses.is_none()));
+        assert!(r.broadcasts.is_empty());
+        assert_eq!(
+            r.direct,
+            vec![ServerMsg::Error {
+                code: ErrorCode::InvalidTransition,
+                message: TransitionError::ResponseTooLong.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn player_submit_rejects_a_signoff_over_200_characters() {
+        let (mut state, token) = host_join();
+        state.add_player("Ann").unwrap();
+        state.add_player("Bo").unwrap();
+        state.start_collecting().unwrap();
+        let r = apply(
+            &mut state,
+            &token,
+            Role::Player,
+            Some("Ann"),
+            ClientMsg::SubmitResponses {
+                responses: vec!["fine".into(), "fine".into()],
+                signoff: "é".repeat(201),
+            },
+        );
+        assert!(state.players.iter().all(|p| p.responses.is_none()));
+        assert!(r.broadcasts.is_empty());
+        assert_eq!(
+            r.direct,
+            vec![ServerMsg::Error {
+                code: ErrorCode::InvalidTransition,
+                message: TransitionError::SignoffTooLong.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn host_add_player_rejects_a_65th_player() {
+        let (mut state, token) = host_join();
+        for i in 0..64 {
+            state.add_player(&format!("p{i}")).unwrap();
+        }
+        let r = apply(
+            &mut state,
+            &token,
+            Role::Host,
+            None,
+            ClientMsg::AddPlayer {
+                name: "one-more".into(),
+            },
+        );
+        assert_eq!(state.players.len(), 64);
+        assert!(r.broadcasts.is_empty());
+        assert_eq!(
+            r.direct,
+            vec![ServerMsg::Error {
+                code: ErrorCode::InvalidTransition,
+                message: TransitionError::RosterFull.to_string(),
+            }]
+        );
     }
 
     #[test]
