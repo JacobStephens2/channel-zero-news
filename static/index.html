@@ -171,10 +171,10 @@
 
 <script type="module">
 import { createRoomSession } from "./room-session.mjs";
+import { createPlayerRoundParticipation } from "./player-round-participation.mjs";
 
 const $ = (id) => document.getElementById(id);
-let lastPrompts = [], assignmentRequested = false, amController = false;
-let iSubmitted = false, promptsOpen = true, currentPhase = null, stageDismissed = false;
+let amController = false, currentPhase = null, stageDismissed = false;
 
 const session = createRoomSession({
   createSocket: () => new WebSocket(wsUrl()),
@@ -188,6 +188,7 @@ const session = createRoomSession({
   onError: (message) => { log("!", message); alert(message); },
   onSend: (message) => log("→", message),
 });
+const participation = createPlayerRoundParticipation({ document, send: (intent) => session.send(intent) });
 
 function log(dir, obj) {
   const el = $("log");
@@ -237,19 +238,16 @@ $("joinBtn").addEventListener("click", () => session.connect({
 }));
 
 function renderSession(view) {
+  participation.updateSession(view);
   $("conn").textContent = ({ connecting: "connecting…", awaiting_joined: "joining…",
     joined: "connected", failed: "error", disconnected: "disconnected" })[view.state];
   $("roomPill").textContent = view.code ? `Room ${view.code}` : "";
   $("roomPill").classList.toggle("hidden", view.state !== "joined");
   if (view.state === "connecting") {
-    lastPrompts = []; assignmentRequested = false; amController = false;
-    iSubmitted = false; promptsOpen = true; currentPhase = null; stageDismissed = false;
-    applyPromptsUI(); setStage(false);
+    amController = false; currentPhase = null; stageDismissed = false;
+    setStage(false);
     $("readerControls").classList.add("hidden");
     $("slidePanel").classList.remove("full");
-    $("promptFields").innerHTML = "";
-    $("submitBtn").classList.add("hidden");
-    $("partnerLine").textContent = "Join to receive your assignment.";
     $("phasePill").textContent = "—";
     $("progressLine").textContent = "Joining room…";
     $("playerList").innerHTML = "";
@@ -262,9 +260,10 @@ function renderSession(view) {
 
 // ---- server event handling (exhaustive) ----
 function handle(msg) {
+  participation.handle(msg);
   switch (msg.type) {
-    case "assignment": renderAssignment(msg); break;
-    case "room_state": renderRoom(msg.room); maybeRequestAssignment(msg.room); break;
+    case "assignment": break;
+    case "room_state": renderRoom(msg.room); break;
     case "submission_progress": renderProgress(msg); break;
     case "game_started": $("slideIdx").textContent = `0 / ${msg.total_slides}`; break;
     case "slide_changed": renderSlide(msg); break;
@@ -273,16 +272,6 @@ function handle(msg) {
       alert(`${msg.code}: ${msg.message}`);
       break;
     default: console.warn("unknown server message", msg);
-  }
-}
-
-// A player who joined while the room was still in the lobby has no assignment
-// yet. Once the host opens submissions, fetch it by re-joining (idempotent —
-// the server just replies with this player's partner + prompts). One-shot per
-// connection so it can't loop.
-function maybeRequestAssignment(room) {
-  if (session.current.role === "player" && room.phase === "collecting" && lastPrompts.length === 0 && !assignmentRequested) {
-    assignmentRequested = session.send({ type: "join_room" });
   }
 }
 
@@ -347,51 +336,10 @@ function renderProgress(msg) {
   renderPlayers(msg.players);
 }
 function renderPlayers(players) {
-  const { role, name: myName } = session.current;
   $("playerList").innerHTML = players.map(p =>
     `<li><span>${escapeHtml(p.name)}</span>${p.submitted ? '<span class="submitted">✓ submitted</span>' : '<span class="muted">…</span>'}</li>`
   ).join("");
-  // Track whether *this* player has submitted, and collapse their prompt box
-  // the first time they do (they can reopen it with the corner toggle).
-  if (role === "player" && myName) {
-    const me = players.find(p => p.name === myName);
-    const sub = !!(me && me.submitted);
-    if (sub && !iSubmitted) promptsOpen = false; // auto-collapse on submit
-    if (!sub) promptsOpen = true;                // new round: reopen
-    iSubmitted = sub;
-    applyPromptsUI();
-  }
 }
-
-// Reflect the collapse state + show the toggle/tag once submitted.
-function applyPromptsUI() {
-  $("promptsBody").classList.toggle("hidden", !promptsOpen);
-  $("promptsToggle").classList.toggle("hidden", !iSubmitted);
-  $("promptsToggle").textContent = promptsOpen ? "▾" : "▸";
-  $("submittedTag").classList.toggle("hidden", !iSubmitted);
-}
-
-function renderAssignment(msg) {
-  lastPrompts = msg.prompts;
-  $("partnerLine").innerHTML = `You're writing for <strong>${escapeHtml(msg.partner)}</strong>. Fill in each line:`;
-  $("promptFields").innerHTML = msg.prompts.map((p, i) =>
-    `<label>${escapeHtml(p) || "Prompt " + (i+1)}</label><textarea data-i="${i}" maxlength="200"></textarea>`
-  ).join("") + `<label>…and remember:</label><textarea id="signoff" maxlength="200"></textarea>`;
-  $("submitBtn").classList.remove("hidden");
-  // Keep collapsed if we already submitted (e.g. reconnecting); else open.
-  promptsOpen = !iSubmitted;
-  applyPromptsUI();
-}
-
-$("submitBtn").addEventListener("click", () => {
-  const responses = [...document.querySelectorAll("#promptFields textarea[data-i]")]
-    .sort((a, b) => a.dataset.i - b.dataset.i).map(t => t.value);
-  const signoff = ($("signoff") || {}).value || "";
-  session.send({ type: "submit_responses", responses, signoff });
-});
-
-// Corner toggle to reopen / recollapse the prompt box after submitting.
-$("promptsToggle").addEventListener("click", () => { promptsOpen = !promptsOpen; applyPromptsUI(); });
 
 // The person who reads a given slide aloud (null for non-spoken slides).
 function readerOf(s) {
