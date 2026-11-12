@@ -120,11 +120,26 @@ cargo test --locked
 ```
 
 The VM modules flag lets the wiring harness execute the actual inline client
-module and its imports against controlled browser adapters. Session tests drive
-the public `connect`, `restore`, `send`, and read-only `current` interface in
-`static/room-session.mjs`. The existing static router serves that module directly;
-`tests/full_flow.rs` checks its URL and JavaScript content type. The database
-test skips its DB assertions when `DATABASE_URL` is unset.
+module and its two allowed imports against controlled browser adapters. Session
+tests drive the public `connect`, `restore`, `send`, and read-only `current`
+interface in `static/room-session.mjs`. The existing static router serves both
+native modules directly; `tests/full_flow.rs` checks their production imports,
+URLs, source bodies, and JavaScript content types. The database test skips its
+DB assertions when `DATABASE_URL` is unset.
+
+`static/player-round-participation.mjs` owns Player round participation. The entry
+constructs it once with the document and a sender that delegates to Room session,
+then forwards session views to `updateSession(view)` and accepted server events
+to `handle(message)`. The module owns assignment replay, form rendering and draft
+DOM, response/sign-off submission, server-confirmed acknowledgement, and prompt
+collapse. Entering a new lobby or starting a replacement connection clears those
+together. Identical assignments within a round preserve drafts and manual
+reopening; a successful replay is limited to one per round, and empty prompt sets
+still support sign-off submission. `tests/player-round-participation.test.mjs`
+exercises that interface with a controlled document and recording sender; entry
+tests verify its wiring through the real Room session. Roster/progress display,
+errors, and performance controls stay in the entry. Room session retains identity
+and connection ownership, and the room actor retains authoritative game state.
 
 ### Database setup (Postgres)
 

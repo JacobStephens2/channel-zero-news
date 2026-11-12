@@ -8,6 +8,100 @@ const room = (phase, submitted = false) => ({ type: "room_state", room: {
   players: [{ name: "Ann", submitted }, { name: "Bo", submitted: false }],
 } });
 
+test("one player connection acquires fresh assignments across consecutive rounds", async () => {
+  const h = await loadClient();
+  h.element("code").value = "AAAA"; h.element("pname").value = "Ann";
+  await h.click("joinBtn");
+  const socket = h.sockets[0]; socket.open();
+  socket.message({ type: "joined", role: "player", name: "Ann" });
+  for (const [partner, prompts] of [["Bo", ["Tonight"]], ["Cy", ["Weather"]], ["Cy", ["Weather"]]]) {
+    const joins = socket.sent.length;
+    socket.message(room("collecting"));
+    assert.equal(socket.sent.length, joins + 1, "each round requests its assignment");
+    socket.message({ type: "assignment", partner, prompts });
+    assert.match(h.element("partnerLine").innerHTML, new RegExp(partner));
+    assert.equal(h.textareas()[0].value, "");
+    h.textareas()[0].value = "Round draft"; h.element("signoff").value = "Good night";
+    socket.message(room("collecting", true));
+    socket.message(room("performing", true)); socket.message(room("archived", true));
+    socket.message({ ...room("lobby"), room: { ...room("lobby").room, players: [] } });
+    assert.equal(h.element("promptFields").innerHTML, "", "lobby clears the previous draft");
+    assert.equal(h.element("submitBtn").classList.contains("hidden"), true);
+    assert.equal(h.element("submittedTag").classList.contains("hidden"), true);
+    socket.message(room("lobby"));
+  }
+  assert.equal(h.sockets.length, 1);
+});
+
+test("duplicate assignment delivery preserves typing and a confirmed form's manual reopening", async () => {
+  const h = await loadClient();
+  h.element("code").value = "AAAA"; h.element("pname").value = "Ann";
+  await h.click("joinBtn");
+  const socket = h.sockets[0]; socket.open();
+  socket.message({ type: "joined", role: "player", name: "Ann" });
+  socket.message(room("collecting"));
+  const assignment = { type: "assignment", partner: "Bo", prompts: ["Tonight", "Weather"] };
+  socket.message(assignment);
+  h.textareas()[0].value = "News"; h.textareas()[1].value = "Rain";
+  h.element("signoff").value = "Good night";
+  socket.message(assignment);
+  assert.deepEqual(h.textareas().map((field) => field.value), ["News", "Rain"]);
+  assert.equal(h.element("signoff").value, "Good night");
+  await h.click("submitBtn");
+  assert.equal(h.element("promptsBody").classList.contains("hidden"), false);
+  assert.equal(h.element("submittedTag").classList.contains("hidden"), true);
+  socket.message({ type: "error", code: "invalid_input", message: "rejected" });
+  assert.deepEqual(h.alerts, ["invalid_input: rejected"]);
+  assert.equal(h.element("promptsBody").classList.contains("hidden"), false);
+  assert.equal(h.element("submittedTag").classList.contains("hidden"), true);
+  socket.message({ type: "submission_progress", submitted: 1, total: 2, players: room("collecting", true).room.players });
+  assert.equal(h.element("promptsBody").classList.contains("hidden"), true);
+  await h.click("promptsToggle");
+  socket.message({ type: "joined", role: "player", name: "Ann" });
+  socket.message(assignment); socket.message(room("collecting", true));
+  socket.message({ type: "submission_progress", submitted: 1, total: 2, players: room("collecting", true).room.players });
+  assert.equal(h.element("promptsBody").classList.contains("hidden"), false);
+  assert.equal(h.element("submittedTag").classList.contains("hidden"), false);
+  assert.equal(h.element("signoff").value, "Good night");
+  await h.click("submitBtn");
+  assert.deepEqual(socket.sent.at(-1), { type: "submit_responses", responses: ["News", "Rain"], signoff: "Good night" });
+  socket.message(room("collecting"));
+  assert.equal(h.element("promptsBody").classList.contains("hidden"), false);
+  assert.equal(h.element("submittedTag").classList.contains("hidden"), true);
+});
+
+test("zero-prompt assignments remain present and replacement clears participation before joining", async () => {
+  const h = await loadClient();
+  h.element("code").value = "AAAA"; h.element("pname").value = "Ann";
+  await h.click("joinBtn");
+  const socket = h.sockets[0]; socket.open();
+  socket.message({ type: "joined", role: "player", name: "Ann" });
+  socket.message(room("collecting"));
+  socket.message({ type: "assignment", partner: "Bo", prompts: [] });
+  h.element("signoff").value = "Stay classy";
+  socket.message(room("collecting"));
+  assert.equal(socket.sent.length, 2);
+  await h.click("submitBtn");
+  assert.deepEqual(socket.sent.at(-1), { type: "submit_responses", responses: [], signoff: "Stay classy" });
+  socket.message(room("collecting", true));
+  h.element("pname").value = "Bo";
+  await h.click("joinBtn");
+  assert.equal(h.element("promptFields").innerHTML, "");
+  assert.equal(h.document.getElementById("signoff"), null);
+  assert.equal(h.element("submitBtn").classList.contains("hidden"), true);
+  assert.equal(h.element("submittedTag").classList.contains("hidden"), true);
+  await h.click("submitBtn");
+  const replacement = h.sockets[1]; replacement.open();
+  replacement.message({ type: "joined", role: "player", name: "Bo" });
+  replacement.message(room("collecting"));
+  assert.deepEqual(replacement.sent.at(-1), { type: "join_room", code: "AAAA", role: "player", name: "Bo", token: null });
+  replacement.message({ type: "assignment", partner: "Ann", prompts: [] });
+  assert.equal(h.element("signoff").value, "");
+  socket.message({ type: "assignment", partner: "Stale", prompts: ["Old"] });
+  assert.match(h.element("partnerLine").innerHTML, /Ann/);
+  assert.equal(h.textareas().length, 0);
+});
+
 test("player form edits cannot change captured join, replay, submissions or reader controls", async () => {
   const h = await loadClient();
   h.element("code").value = " aaaa "; h.element("pname").value = " Ann ";
@@ -23,6 +117,9 @@ test("player form edits cannot change captured join, replay, submissions or read
   socket.message(room("collecting"));
   assert.deepEqual(socket.sent[1], socket.sent[0]);
   socket.message({ type: "assignment", partner: "Bo", prompts: ["Tonight", "Weather"] });
+  socket.message({ type: "submission_progress", submitted: 1, total: 2,
+    players: [{ name: "Ann", submitted: false }, { name: "Bo", submitted: true }] });
+  assert.equal(h.element("submittedTag").classList.contains("hidden"), true, "pending name Bo cannot drive Ann's status");
   h.textareas()[0].value = "News"; h.textareas()[1].value = "Rain";
   h.element("signoff").value = "Good night";
   await h.click("submitBtn");
