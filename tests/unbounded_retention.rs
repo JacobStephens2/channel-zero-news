@@ -10,11 +10,13 @@ use channel_zero::app::{build_router, AppState};
 use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
 use channel_zero::registry::MAX_LIVE_ROOMS;
 use channel_zero::state::PromptSet;
-use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use futures_util::SinkExt;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+#[path = "common/mod.rs"]
+mod common;
+
+use common::recv_until;
 
 fn prompt_sets() -> Vec<PromptSet> {
     vec![PromptSet {
@@ -41,10 +43,7 @@ async fn spawn_server() -> Running {
         axum::serve(listener, app).await.expect("serve");
     });
 
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("client");
+    let http = http();
     let health_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         if let Ok(response) = http.get(format!("http://{addr}/health")).send().await {
@@ -206,30 +205,4 @@ async fn create_past_the_cap_returns_unavailable_and_retains_nothing() {
     );
     assert_eq!(running.state.registry.count().await, MAX_LIVE_ROOMS);
     drop(sockets);
-}
-
-async fn recv_until<F>(ws: &mut Ws, mut pred: F) -> ServerMsg
-where
-    F: FnMut(&ServerMsg) -> bool,
-{
-    let deadline = tokio::time::sleep(Duration::from_secs(5));
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            _ = &mut deadline => panic!("timed out waiting for a matching server message"),
-            frame = ws.next() => {
-                match frame {
-                    Some(Ok(Message::Text(text))) => {
-                        let msg: ServerMsg = serde_json::from_str(&text)
-                            .unwrap_or_else(|e| panic!("bad server msg {text:?}: {e}"));
-                        if pred(&msg) {
-                            return msg;
-                        }
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("socket closed early: {other:?}"),
-                }
-            }
-        }
-    }
 }

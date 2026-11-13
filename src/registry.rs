@@ -59,7 +59,7 @@ pub struct Registry {
 struct RetainedRoom {
     handle: RoomHandle,
     sockets: usize,
-    generation: u64,
+    idle_generation: u64,
 }
 
 /// What a freshly created room hands back to the host: the public join code and
@@ -137,7 +137,7 @@ impl Registry {
                 RetainedRoom {
                     handle,
                     sockets: 0,
-                    generation: INITIAL_IDLE_GENERATION,
+                    idle_generation: INITIAL_IDLE_GENERATION,
                 },
             );
             (code, host_token)
@@ -158,7 +158,7 @@ impl Registry {
         let room = rooms.get_mut(code)?;
         if room.sockets == 0 {
             // Invalidate the empty-interval sleep armed while no socket was open.
-            room.generation = room.generation.wrapping_add(1);
+            room.idle_generation = room.idle_generation.wrapping_add(1);
         }
         room.sockets += 1;
         let handle = room.handle.clone();
@@ -193,8 +193,8 @@ impl Registry {
             if room.sockets > 0 {
                 return;
             }
-            room.generation = room.generation.wrapping_add(1);
-            room.generation
+            room.idle_generation = room.idle_generation.wrapping_add(1);
+            room.idle_generation
         };
         self.arm_idle(code.to_string(), generation);
     }
@@ -214,7 +214,7 @@ impl Registry {
     /// [`Self::remove`] uses, and only while this empty interval is still current.
     fn reap_idle(&self, code: &str, generation: u64) {
         self.remove_room(code, |room| {
-            room.sockets == 0 && room.generation == generation
+            room.sockets == 0 && room.idle_generation == generation
         });
     }
 
