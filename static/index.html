@@ -60,7 +60,7 @@
   #exitStage { position:absolute; top:10px; left:14px; z-index:1001; background:#0c121d; color:var(--ink); border:1px solid var(--line); border-radius:7px; padding:6px 12px; cursor:pointer; }
   body.stage-mode #slide {
     flex:1; border:0; background:transparent; line-height:1.15; padding:3vw;
-    font-size:64px; /* fallback; fitStage() sizes it to fill the screen */
+    font-size:64px; /* fallback; Performance stage sizes it to fill the screen */
     overflow:hidden;
   }
   /* Readable, balanced slide text. The stage and the full-width reader view
@@ -172,9 +172,9 @@
 <script type="module">
 import { createRoomSession } from "./room-session.mjs";
 import { createPlayerRoundParticipation } from "./player-round-participation.mjs";
+import { createPerformanceStage } from "./performance-stage.mjs";
 
 const $ = (id) => document.getElementById(id);
-let amController = false, currentPhase = null, stageDismissed = false;
 
 const session = createRoomSession({
   createSocket: () => new WebSocket(wsUrl()),
@@ -189,6 +189,7 @@ const session = createRoomSession({
   onSend: (message) => log("→", message),
 });
 const participation = createPlayerRoundParticipation({ document, send: (intent) => session.send(intent) });
+const performance = createPerformanceStage({ document, window, send: (intent) => session.send(intent) });
 
 function log(dir, obj) {
   const el = $("log");
@@ -239,21 +240,15 @@ $("joinBtn").addEventListener("click", () => session.connect({
 
 function renderSession(view) {
   participation.updateSession(view);
+  performance.updateSession(view);
   $("conn").textContent = ({ connecting: "connecting…", awaiting_joined: "joining…",
     joined: "connected", failed: "error", disconnected: "disconnected" })[view.state];
   $("roomPill").textContent = view.code ? `Room ${view.code}` : "";
   $("roomPill").classList.toggle("hidden", view.state !== "joined");
   if (view.state === "connecting") {
-    amController = false; currentPhase = null; stageDismissed = false;
-    setStage(false);
-    $("readerControls").classList.add("hidden");
-    $("slidePanel").classList.remove("full");
     $("phasePill").textContent = "—";
     $("progressLine").textContent = "Joining room…";
     $("playerList").innerHTML = "";
-    $("slideIdx").textContent = "—";
-    $("slide").textContent = "The carousel will appear here once the game starts.";
-    $("slide").classList.add("muted");
   }
   applyRoleUI();
 }
@@ -261,12 +256,13 @@ function renderSession(view) {
 // ---- server event handling (exhaustive) ----
 function handle(msg) {
   participation.handle(msg);
+  performance.handle(msg);
   switch (msg.type) {
     case "assignment": break;
     case "room_state": renderRoom(msg.room); break;
     case "submission_progress": renderProgress(msg); break;
-    case "game_started": $("slideIdx").textContent = `0 / ${msg.total_slides}`; break;
-    case "slide_changed": renderSlide(msg); break;
+    case "game_started":
+    case "slide_changed": break;
     case "pong": break;
     case "error":
       alert(`${msg.code}: ${msg.message}`);
@@ -276,61 +272,11 @@ function handle(msg) {
 }
 
 function renderRoom(room) {
-  currentPhase = room.phase;
   $("phasePill").textContent = room.phase;
-  $("slideIdx").textContent = `${room.current_slide} / ${room.total_slides}`;
   $("progressLine").textContent = `${room.players.length} player(s) · phase: ${room.phase}`;
   renderPlayers(room.players);
-  // Leaving the performance (archived / new round) drops the stage + controls.
-  if (room.phase !== "performing") {
-    setStage(false);
-    amController = false;
-    stageDismissed = false; // re-arm full screen for the next performance
-    $("readerControls").classList.add("hidden");
-  }
-  updateStageWidth();
-  updateStageControls();
 }
 
-function setStage(on) { document.body.classList.toggle("stage-mode", on); updateStageControls(); fitStage(); }
-
-// Teleprompter sizing: pick the largest font (binary search) at which the
-// current slide still fits the screen, so the display fills the available space
-// whether the slide is one line or a paragraph. Legible from across the room.
-function fitStage() {
-  const slide = $("slide");
-  if (!document.body.classList.contains("stage-mode")) { slide.style.fontSize = ""; return; }
-  const fits = () => slide.scrollHeight <= slide.clientHeight && slide.scrollWidth <= slide.clientWidth;
-  let lo = 24, hi = 320, best = lo;
-  for (let i = 0; i < 9; i++) {
-    const mid = Math.floor((lo + hi) / 2);
-    slide.style.fontSize = mid + "px";
-    if (fits()) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
-  }
-  slide.style.fontSize = best + "px";
-}
-window.addEventListener("resize", fitStage);
-
-// Show the Exit button while in full-screen stage; show the re-enter button for
-// the display once it has dropped out of full screen mid-performance.
-function updateStageControls() {
-  const inStage = document.body.classList.contains("stage-mode");
-  $("exitStage").classList.toggle("hidden", !inStage);
-  $("enterStage").classList.toggle("hidden",
-    !(session.current.role === "display" && currentPhase === "performing" && !inStage));
-}
-
-$("exitStage").addEventListener("click", () => { stageDismissed = true; setStage(false); });
-$("enterStage").addEventListener("click", () => { stageDismissed = false; setStage(true); });
-
-// The stage panel spans the full width for the host during the show and for the
-// player whose turn it is to read (so their lines are large and easy to read).
-function updateStageWidth() {
-  const { role } = session.current;
-  const wide = currentPhase === "performing" &&
-    (role === "host" || role === "display" || (role === "player" && amController));
-  $("slidePanel").classList.toggle("full", wide);
-}
 function renderProgress(msg) {
   $("progressLine").textContent = `${msg.submitted} / ${msg.total} submitted`;
   renderPlayers(msg.players);
@@ -341,75 +287,6 @@ function renderPlayers(players) {
   ).join("");
 }
 
-// The person who reads a given slide aloud (null for non-spoken slides).
-function readerOf(s) {
-  switch (s.kind) {
-    case "script": return s.reader;
-    case "greeting":
-    case "signoff": return s.presenter;
-    default: return null; // rules / presenter_intro / credits / blank
-  }
-}
-
-// The slide's spoken/announcement content.
-function slideContentHtml(s) {
-  switch (s.kind) {
-    case "rules": return "<div><strong>The rules</strong><br>When it's your turn to read, DO NOT LAUGH.<br>The host advances the slides.</div>";
-    case "presenter_intro":
-      return s.first
-        ? `To start us off, <strong>${escapeHtml(s.presenter)}</strong> presents, with ${escapeHtml(s.teleprompter)} on teleprompter.`
-        : `Next up: <strong>${escapeHtml(s.presenter)}</strong> reads, with ${escapeHtml(s.teleprompter)} on teleprompter.`;
-    case "greeting": return `Good evening! I'm <strong>${escapeHtml(s.presenter)}</strong>, and this is today's Channel 0 News.`;
-    case "script": return escapeHtml(s.text);
-    case "signoff": return `That's all for today. This is ${escapeHtml(s.presenter)} signing off, and remember: ${escapeHtml(s.text)}`;
-    case "credits": return "<strong>Thanks for playing!</strong>";
-    case "blank": return "";
-    default: return "?";
-  }
-}
-
-function readingBanner(reader) {
-  return `<div class="reading-now">🎤 <strong>${escapeHtml(reader)}</strong> is reading…</div>`;
-}
-
-function renderSlide(msg) {
-  const { role, name: myName } = session.current;
-  $("slideIdx").textContent = `${msg.index} / ${msg.total_slides}`;
-  const s = msg.slide;
-  const reader = readerOf(s);
-  // The server tells us who may advance this slide (handles the rules slide,
-  // where the first presenter — not derivable from the slide alone — controls).
-  const controller = msg.controller || null;
-  const content = slideContentHtml(s);
-  const el = $("slide");
-  el.classList.remove("muted");
-  amController = !!(myName && controller && myName === controller);
-
-  if (role === "display") {
-    // The shared screen is the full-screen teleprompter (unless exited).
-    el.innerHTML = `<div class="stage-content">${content}</div>`;
-    setStage(!stageDismissed);
-  } else if (role === "player") {
-    setStage(false);
-    if (amController) {
-      // Your turn: show your lines (full width) + your own carousel controls.
-      const badge = reader ? `<div class="badge">YOUR TURN TO READ 🎤</div>` : "";
-      el.innerHTML = `${badge}<div class="stage-content">${content}</div>`;
-    } else if (reader) {
-      el.innerHTML = readingBanner(reader);
-    } else {
-      el.innerHTML = content; // transition / announcement: everyone sees it
-    }
-  } else {
-    // Host: follow along with who's reading.
-    el.innerHTML = (reader ? `<p class="muted" style="margin:0 0 8px">🎤 ${escapeHtml(reader)} is reading</p>` : "") + content;
-    setStage(false);
-  }
-  // The reader gets their own Prev/Next while it's their segment.
-  $("readerControls").classList.toggle("hidden", !(role === "player" && amController));
-  updateStageWidth();
-}
-
 // ---- host control buttons ----
 $("addBtn").addEventListener("click", () => {
   const name = $("newPlayer").value.trim();
@@ -417,22 +294,8 @@ $("addBtn").addEventListener("click", () => {
 });
 $("collectBtn").addEventListener("click", () => session.send({ type: "start_collecting" }));
 $("startBtn").addEventListener("click", () => session.send({ type: "start_game" }));
-$("prevBtn").addEventListener("click", () => session.send({ type: "prev_slide" }));
-$("nextBtn").addEventListener("click", () => session.send({ type: "advance_slide" }));
-// Reader's own carousel controls.
-$("rPrev").addEventListener("click", () => session.send({ type: "prev_slide" }));
-$("rNext").addEventListener("click", () => session.send({ type: "advance_slide" }));
 $("archiveBtn").addEventListener("click", () => session.send({ type: "archive_round" }));
 $("newRoundBtn").addEventListener("click", () => session.send({ type: "new_round" }));
-
-// keyboard: arrows drive the carousel for whoever is host
-document.addEventListener("keydown", (e) => {
-  const { role } = session.current;
-  const canDrive = role === "host" || (role === "player" && amController);
-  if (!canDrive) return;
-  if (e.key === "ArrowRight") session.send({ type: "advance_slide" });
-  if (e.key === "ArrowLeft") session.send({ type: "prev_slide" });
-});
 
 function escapeHtml(s) { return (s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
 

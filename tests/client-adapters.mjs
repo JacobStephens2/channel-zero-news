@@ -1,4 +1,4 @@
-// Controlled browser boundaries shared by the session and client-entry tests.
+// Controlled browser boundaries shared by client interface and entry tests.
 export class ControlledSocket {
   readyState = 0;
   sent = [];
@@ -54,7 +54,7 @@ export class ControlledElement {
   get innerHTML() { return this.html ?? ""; }
 }
 
-// Both interface and entry tests render the production form into this document.
+// Interface and entry tests use the production document's selectors and classes.
 export function controlledDocument(html) {
   const elements = new Map();
   for (const tag of html.matchAll(/<[^>]+\bid="([^"]+)"[^>]*>/g)) {
@@ -78,4 +78,22 @@ export function controlledDocument(html) {
   };
   return { document, element, textareas: () => textareas,
     click: (id) => element(id).dispatch("click") };
+}
+
+// Measurements depend on the font under test, unlike the default fixed DOM.
+// Mutable bounds let resize tests change available space without timers.
+export function measureSlide(slide, overrides = {}) {
+  const bounds = { width: 1000, height: 800, widthPerPixel: 1, heightPerPixel: 2, ...overrides };
+  const probes = [];
+  Object.defineProperties(slide, {
+    clientWidth: { get: () => bounds.width },
+    clientHeight: { get: () => bounds.height },
+    scrollWidth: { get: () => parseInt(slide.style.fontSize) * bounds.widthPerPixel },
+    scrollHeight: { get: () => {
+      const font = parseInt(slide.style.fontSize);
+      probes.push(font);
+      return font * bounds.heightPerPixel;
+    } },
+  });
+  return { bounds, probes };
 }

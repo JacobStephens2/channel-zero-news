@@ -111,7 +111,7 @@ cargo test --test persistence # DB-backed persistence (skipped if no DATABASE_UR
 cargo run                     # serves on 0.0.0.0:3471
 ```
 
-Client connection and entry-wiring tests use Node 22 or newer, with no package
+Client interface and entry-wiring tests use Node 22 or newer, with no package
 manager or client build step:
 
 ```bash
@@ -120,9 +120,9 @@ cargo test --locked
 ```
 
 The VM modules flag lets the wiring harness execute the actual inline client
-module and its two allowed imports against controlled browser adapters. Session
+module and its three allowed imports against controlled browser adapters. Session
 tests drive the public `connect`, `restore`, `send`, and read-only `current`
-interface in `static/room-session.mjs`. The existing static router serves both
+interface in `static/room-session.mjs`. The existing static router serves all three
 native modules directly; `tests/full_flow.rs` checks their production imports,
 URLs, source bodies, and JavaScript content types. The database test skips its
 DB assertions when `DATABASE_URL` is unset.
@@ -138,8 +138,27 @@ reopening; a successful replay is limited to one per round, and empty prompt set
 still support sign-off submission. `tests/player-round-participation.test.mjs`
 exercises that interface with a controlled document and recording sender; entry
 tests verify its wiring through the real Room session. Roster/progress display,
-errors, and performance controls stay in the entry. Room session retains identity
-and connection ownership, and the room actor retains authoritative game state.
+errors, and host round-management controls stay in the entry. Room session retains
+identity and connection ownership, and the room actor retains authoritative game state.
+
+`static/performance-stage.mjs` owns Performance stage. The entry constructs one
+instance with document/window adapters and a sender delegated to Room session,
+then forwards session views to `updateSession(view)` and accepted events to
+`handle(message)`. Those are its only public operations. The module coordinates
+slide content/index, server-assigned controller eligibility, role presentation,
+display dismissal, stage classes, bounded font fitting, resize and local stage
+controls, and all carousel buttons/arrow keys. It uses acknowledged identity,
+independent of pending join-form edits. A connecting session resets presentation
+together; terminal sessions retain the last slide and local viewport controls,
+while carousel input requires a joined acknowledged host or player controller.
+Slides are processed in delivery order, including before a performing snapshot;
+leaving performing clears controller eligibility and re-arms display entry for
+the next performance. There is no client deck cache or authoritative game state.
+Player round participation remains independent. Deterministic interface tests in
+`tests/performance-stage.test.mjs` cover all slide kinds/roles, event ordering,
+session and round transitions, carousel intents and font-dependent fit/resize.
+Entry tests retain real Room session regressions for host navigation, player
+controller handoff, display restore/dismissal/resize and obsolete socket events.
 
 ### Database setup (Postgres)
 
