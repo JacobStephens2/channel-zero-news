@@ -64,8 +64,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         _ => unreachable!(),
     };
 
-    let handle: RoomHandle = match state.registry.get(&code).await {
-        Some(h) => h,
+    // Counting starts once the join names a retained room, and lasts until this
+    // connection task ends. `room_info` lookups do not hold a socket.
+    let (handle, _socket): (RoomHandle, _) = match state.registry.open_socket(&code).await {
+        Some(open) => open,
         None => {
             let _ = send_one(
                 &mut sink,

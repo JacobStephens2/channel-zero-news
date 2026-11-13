@@ -16,6 +16,9 @@ pub enum AppError {
     NotFound(String),
     #[error("{0}")]
     BadRequest(String),
+    /// Creation could not retain a room (live-room cap or join-code attempts).
+    #[error("{0}")]
+    Unavailable(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -25,6 +28,7 @@ impl AppError {
         match self {
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
+            AppError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
     }

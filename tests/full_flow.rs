@@ -3,14 +3,17 @@
 //! submit -> start game -> advance slides -> archive. Exercises host/player/
 //! display roles and server-side host enforcement against the live router.
 
-use std::time::Duration;
-
 use channel_zero::app::{build_router, AppState};
 use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
 use channel_zero::state::{Phase, PromptSet, Slide};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+
+#[path = "common/mod.rs"]
+mod common;
+
+use common::recv_until;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -73,33 +76,6 @@ async fn send(ws: &mut Ws, msg: &ClientMsg) {
     ws.send(Message::Text(serde_json::to_string(msg).unwrap()))
         .await
         .unwrap();
-}
-
-/// Read frames until one satisfies `pred`, returning it. Fails on timeout.
-async fn recv_until<F>(ws: &mut Ws, mut pred: F) -> ServerMsg
-where
-    F: FnMut(&ServerMsg) -> bool,
-{
-    let deadline = tokio::time::sleep(Duration::from_secs(5));
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            _ = &mut deadline => panic!("timed out waiting for a matching server message"),
-            frame = ws.next() => {
-                match frame {
-                    Some(Ok(Message::Text(t))) => {
-                        let msg: ServerMsg = serde_json::from_str(&t)
-                            .unwrap_or_else(|e| panic!("bad server msg {t:?}: {e}"));
-                        if pred(&msg) {
-                            return msg;
-                        }
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("socket closed early: {other:?}"),
-                }
-            }
-        }
-    }
 }
 
 async fn connect(addr: &str) -> Ws {
