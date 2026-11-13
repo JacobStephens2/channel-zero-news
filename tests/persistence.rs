@@ -64,7 +64,10 @@ async fn final_responses_and_archive_persist_to_postgres() {
     let pool = sqlx::PgPool::connect(&url).await.expect("pool");
 
     let registry = Registry::new();
-    let room = registry.create_room(prompts, Some(db.clone())).await;
+    let room = registry
+        .create_room(prompts, Some(db.clone()))
+        .await
+        .expect("create room");
     let code = room.code.clone();
     let handle = registry.get(&code).await.unwrap();
 

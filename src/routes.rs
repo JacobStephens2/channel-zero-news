@@ -36,7 +36,8 @@ pub async fn create_room(
     let room = state
         .registry
         .create_room(prompts, state.db.clone())
-        .await;
+        .await
+        .map_err(|err| AppError::Unavailable(err.to_string()))?;
     Ok(Json(CreateRoomResponse {
         code: room.code,
         host_token: room.host_token,
