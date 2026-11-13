@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { loadClient } from "./client-entry-harness.mjs";
-import { memoryStorage } from "./client-adapters.mjs";
+import { measureSlide, memoryStorage } from "./client-adapters.mjs";
 
 const room = (phase, submitted = false) => ({ type: "room_state", room: {
   code: "AAAA", phase, current_slide: 0, total_slides: 10,
@@ -141,6 +141,17 @@ test("player form edits cannot change captured join, replay, submissions or read
   assert.equal(h.element("readerControls").classList.contains("hidden"), false);
   assert.equal(h.sockets.length, 1);
   assert.deepEqual(h.storage.saved(), { code: "AAAA", role: "player", name: "Ann", hostToken: null });
+  socket.message({ type: "slide_changed", index: 3, total_slides: 10, controller: "Bo",
+    slide: { kind: "script", reader: "Bo", text: "Bo's private lines" } });
+  socket.message(room("performing", true));
+  assert.equal(h.element("readerControls").classList.contains("hidden"), true);
+  assert.equal(h.element("slidePanel").classList.contains("full"), false);
+  assert.match(h.element("slide").innerHTML, /Bo.*is reading/);
+  assert.doesNotMatch(h.element("slide").innerHTML, /private lines/);
+  const afterHandoff = socket.sent.length;
+  await h.click("rNext"); await h.click("rPrev");
+  await h.document.dispatch("keydown", { key: "ArrowRight" });
+  assert.equal(socket.sent.length, afterHandoff);
 });
 
 test("host creation connects with returned credentials despite pending form edits", async () => {
@@ -164,6 +175,21 @@ test("host creation connects with returned credentials despite pending form edit
   assert.deepEqual(socket.sent.at(-1), { type: "add_player", name: "Ann" });
   await h.click("collectBtn");
   assert.deepEqual(socket.sent.at(-1), { type: "start_collecting" });
+  const beforeSlides = socket.sent.length;
+  socket.message({ type: "game_started", total_slides: 10 });
+  socket.message({ type: "slide_changed", index: 0, total_slides: 10, controller: "Ann", slide: { kind: "rules" } });
+  socket.message(room("performing"));
+  await h.editRole("player");
+  await h.click("nextBtn"); await h.click("prevBtn");
+  await h.document.dispatch("keydown", { key: "ArrowRight" });
+  await h.document.dispatch("keydown", { key: "ArrowLeft" });
+  assert.deepEqual(socket.sent.slice(beforeSlides), [
+    { type: "advance_slide" }, { type: "prev_slide" }, { type: "advance_slide" }, { type: "prev_slide" },
+  ]);
+  socket.close();
+  await h.click("nextBtn"); await h.click("prevBtn");
+  await h.document.dispatch("keydown", { key: "ArrowRight" });
+  assert.equal(socket.sent.length, beforeSlides + 4);
   assert.deepEqual(h.storage.saved(), { code: "HOST", role: "host", name: null, hostToken: "secret" });
 });
 
@@ -172,6 +198,7 @@ test("display refresh restores through the session and retains stage sizing and 
   const h = await loadClient({ storage });
   assert.equal(h.element("code").value, "SHOW");
   assert.equal(h.element("role").value, "display");
+  const { bounds } = measureSlide(h.element("slide"), { height: 240 });
   const socket = h.sockets[0]; socket.open(); socket.message({ type: "joined", role: "display" });
   await h.editRole("host");
   socket.message(room("performing"));
@@ -179,7 +206,10 @@ test("display refresh restores through the session and retains stage sizing and 
     slide: { kind: "script", reader: "Ann", text: "Display lines" }, controller: "Ann" });
   assert.equal(h.document.body.classList.contains("stage-mode"), true);
   assert.match(h.element("slide").innerHTML, /Display lines/);
-  assert.match(h.element("slide").style.fontSize, /^\d+px$/);
+  assert.equal(h.element("slide").style.fontSize, "120px");
+  bounds.height = 360;
+  await h.window.dispatch("resize");
+  assert.equal(h.element("slide").style.fontSize, "180px");
   assert.equal(h.element("hostPanel").classList.contains("hidden"), true);
   assert.equal(h.element("readerControls").classList.contains("hidden"), true);
   const sent = socket.sent.length;
@@ -188,12 +218,27 @@ test("display refresh restores through the session and retains stage sizing and 
   await h.click("exitStage");
   assert.equal(h.document.body.classList.contains("stage-mode"), false);
   assert.equal(h.element("enterStage").classList.contains("hidden"), false);
+  socket.message({ type: "slide_changed", index: 3, total_slides: 10,
+    slide: { kind: "credits" }, controller: null });
+  socket.message(room("performing")); socket.message(room("performing"));
+  assert.equal(h.document.body.classList.contains("stage-mode"), false);
+  assert.equal(h.element("slide").style.fontSize, "");
   await h.click("enterStage");
   assert.equal(h.document.body.classList.contains("stage-mode"), true);
+  socket.message(room("archived")); socket.message(room("lobby")); socket.message(room("collecting"));
+  socket.message({ type: "game_started", total_slides: 10 });
+  socket.message({ type: "slide_changed", index: 0, total_slides: 10, slide: { kind: "rules" }, controller: "Ann" });
+  assert.equal(h.document.body.classList.contains("stage-mode"), true);
+  socket.message(room("performing"));
   socket.close();
   assert.equal(h.element("conn").textContent, "disconnected");
   assert.equal(h.element("roomPill").classList.contains("hidden"), true);
   assert.equal(storage.saved().code, "SHOW");
+  bounds.height = 200;
+  await h.window.dispatch("resize");
+  assert.equal(h.element("slide").style.fontSize, "100px");
+  await h.click("exitStage"); await h.click("enterStage");
+  assert.equal(h.document.body.classList.contains("stage-mode"), true);
 });
 
 test("obsolete callbacks cannot change current UI, recovery or replacement sends", async () => {
@@ -201,13 +246,26 @@ test("obsolete callbacks cannot change current UI, recovery or replacement sends
   h.element("code").value = "AAAA"; h.element("pname").value = "Ann";
   await h.click("joinBtn");
   const old = h.sockets[0]; old.open(); old.message({ type: "joined", role: "player", name: "Ann" });
+  old.message(room("performing"));
+  old.message({ type: "slide_changed", index: 2, total_slides: 10, controller: "Ann",
+    slide: { kind: "script", reader: "Ann", text: "Previous performance" } });
   h.element("code").value = "BBBB"; h.element("pname").value = "Bo";
   await h.click("joinBtn");
+  assert.match(h.element("slide").textContent, /carousel will appear/);
+  assert.equal(h.element("readerControls").classList.contains("hidden"), true);
+  assert.equal(h.element("slidePanel").classList.contains("full"), false);
+  old.message({ type: "game_started", total_slides: 99 });
+  old.message(room("performing"));
+  assert.equal(h.element("slideIdx").textContent, "—");
   const current = h.sockets[1]; current.open(); current.message({ type: "joined", role: "player", name: "Bo" });
   const saved = h.storage.saved(), log = h.element("log").textContent;
   old.open(); old.message({ type: "error", code: "unknown_room", message: "stale" });
   old.message({ type: "assignment", partner: "Old", prompts: ["stale"] });
-  old.message({ type: "slide_changed", index: 9 }); old.error(); old.close();
+  old.message({ type: "slide_changed", index: 9, total_slides: 10, controller: "Bo",
+    slide: { kind: "script", reader: "Bo", text: "Obsolete" } }); old.error(); old.close();
+  assert.match(h.element("slide").textContent, /carousel will appear/);
+  assert.equal(h.element("slideIdx").textContent, "—");
+  await h.click("rNext");
   assert.equal(h.element("conn").textContent, "connected");
   assert.equal(h.element("roomPill").textContent, "Room BBBB");
   assert.equal(h.element("roomPill").classList.contains("hidden"), false);

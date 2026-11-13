@@ -54,6 +54,10 @@ async fn client_native_modules_are_served_without_a_build_step() {
             "player-round-participation.mjs",
             include_str!("../static/player-round-participation.mjs"),
         ),
+        (
+            "performance-stage.mjs",
+            include_str!("../static/performance-stage.mjs"),
+        ),
     ] {
         assert!(html.contains(&format!("from \"./{path}\"")));
         let module = http
