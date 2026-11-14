@@ -89,3 +89,41 @@ impl DirectReceiver {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ErrorCode;
+    use futures_util::FutureExt;
+
+    fn numbered(i: usize) -> ServerMsg {
+        ServerMsg::Error {
+            code: ErrorCode::BadRequest,
+            message: format!("reply {i}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replies_from_the_overflow_on_never_arrive() {
+        let (tx, mut rx) = channel();
+        let overflowed = rx.overflowed();
+        // One more reply than the channel holds, so the last one overflows it.
+        for i in 0..=DIRECT_REPLY_CAPACITY {
+            tx.send(numbered(i));
+        }
+        let signalled = overflowed.now_or_never().is_some();
+        assert!(signalled, "the overflowing send did not signal it");
+
+        // Reading frees a slot, but a reply sent after the overflow must not
+        // take it: only the replies queued before it arrive, in order.
+        assert_eq!(rx.recv().await, Some(numbered(0)));
+        tx.send(numbered(DIRECT_REPLY_CAPACITY + 1));
+        drop(tx);
+        let mut rest = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            rest.push(reply);
+        }
+        let queued: Vec<_> = (1..DIRECT_REPLY_CAPACITY).map(numbered).collect();
+        assert_eq!(rest, queued);
+    }
+}

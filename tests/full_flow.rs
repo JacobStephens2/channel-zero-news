@@ -108,6 +108,22 @@ async fn create_room(addr: &str) -> (String, String) {
     )
 }
 
+/// Connect and send `msg`, a `JoinRoom`, returning the socket once the server
+/// acknowledges the role it asked for.
+async fn join(addr: &str, msg: &ClientMsg) -> Ws {
+    let ClientMsg::JoinRoom { role, .. } = msg else {
+        panic!("join needs a JoinRoom message, got {msg:?}");
+    };
+    let mut ws = connect(addr).await;
+    send(&mut ws, msg).await;
+    let joined = recv_until(&mut ws, |m| matches!(m, ServerMsg::Joined { .. })).await;
+    assert!(
+        matches!(joined, ServerMsg::Joined { role: acked, .. } if acked == *role),
+        "asked to join as {role:?}, got {joined:?}"
+    );
+    ws
+}
+
 #[tokio::test]
 async fn full_game_over_websocket() {
     let addr = spawn_server().await;
@@ -116,9 +132,8 @@ async fn full_game_over_websocket() {
     let (code, host_token) = create_room(&addr).await;
 
     // ---- host joins ----
-    let mut host = connect(&addr).await;
-    send(
-        &mut host,
+    let mut host = join(
+        &addr,
         &ClientMsg::JoinRoom {
             code: code.clone(),
             role: Role::Host,
@@ -127,8 +142,6 @@ async fn full_game_over_websocket() {
         },
     )
     .await;
-    let joined = recv_until(&mut host, |m| matches!(m, ServerMsg::Joined { .. })).await;
-    assert!(matches!(joined, ServerMsg::Joined { role: Role::Host, .. }));
 
     // ---- host builds the roster ----
     for name in ["Ann", "Bo"] {
@@ -141,9 +154,8 @@ async fn full_game_over_websocket() {
     .await;
 
     // ---- display screen joins (read-only) ----
-    let mut display = connect(&addr).await;
-    send(
-        &mut display,
+    let mut display = join(
+        &addr,
         &ClientMsg::JoinRoom {
             code: code.clone(),
             role: Role::Display,
@@ -152,7 +164,6 @@ async fn full_game_over_websocket() {
         },
     )
     .await;
-    recv_until(&mut display, |m| matches!(m, ServerMsg::Joined { .. })).await;
 
     // ---- a display screen must NOT be able to drive the game ----
     send(&mut display, &ClientMsg::StartCollecting).await;
@@ -310,9 +321,8 @@ async fn a_socket_that_stops_reading_is_closed_while_the_room_serves_others() {
     let addr = spawn_server().await;
     let (code, host_token) = create_room(&addr).await;
 
-    let mut host = connect(&addr).await;
-    send(
-        &mut host,
+    let mut host = join(
+        &addr,
         &ClientMsg::JoinRoom {
             code: code.clone(),
             role: Role::Host,
@@ -321,7 +331,6 @@ async fn a_socket_that_stops_reading_is_closed_while_the_room_serves_others() {
         },
     )
     .await;
-    recv_until(&mut host, |m| matches!(m, ServerMsg::Joined { .. })).await;
     for i in 0..MAX_ROSTER_PLAYERS {
         let name = longest_name(i);
         send(&mut host, &ClientMsg::AddPlayer { name }).await;
@@ -335,9 +344,7 @@ async fn a_socket_that_stops_reading_is_closed_while_the_room_serves_others() {
         name: None,
         token: None,
     };
-    let mut stalled = connect(&addr).await;
-    send(&mut stalled, &display_join).await;
-    recv_until(&mut stalled, |m| matches!(m, ServerMsg::Joined { .. })).await;
+    let mut stalled = join(&addr, &display_join).await;
 
     // Keep sending without ever reading again, until the server closes the
     // socket and a send fails.
@@ -367,7 +374,6 @@ async fn a_socket_that_stops_reading_is_closed_while_the_room_serves_others() {
     // The room still answers its host and admits a new socket.
     send(&mut host, &ClientMsg::Ping).await;
     recv_until(&mut host, |m| matches!(m, ServerMsg::Pong)).await;
-    let mut display = connect(&addr).await;
-    send(&mut display, &display_join).await;
+    let mut display = join(&addr, &display_join).await;
     recv_until(&mut display, is_full_roster).await;
 }

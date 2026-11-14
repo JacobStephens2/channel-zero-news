@@ -509,6 +509,25 @@ mod tests {
         (GameState::new("ABCD", sets()), "secret-token".to_string())
     }
 
+    /// Dispatch `intent` from a connection whose direct replies go to `direct`.
+    async fn dispatch_from(
+        handle: &RoomHandle,
+        direct: &DirectSender,
+        role: Role,
+        name: Option<&str>,
+        intent: ClientMsg,
+    ) {
+        handle
+            .dispatch(Command {
+                intent,
+                role,
+                name: name.map(String::from),
+                direct: direct.clone(),
+            })
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn non_host_add_player_is_forbidden() {
         let (mut state, token) = host_join();
@@ -929,16 +948,9 @@ mod tests {
         let mut a = handle.subscribe();
         let mut b = handle.subscribe();
 
-        let (direct, _direct_rx) = direct::channel();
-        handle
-            .dispatch(Command {
-                intent: ClientMsg::AddPlayer { name: "Ann".into() },
-                role: Role::Host,
-                name: None,
-                direct,
-            })
-            .await
-            .unwrap();
+        let (tx, _rx) = direct::channel();
+        let intent = ClientMsg::AddPlayer { name: "Ann".into() };
+        dispatch_from(&handle, &tx, Role::Host, None, intent).await;
 
         let ma = a.recv().await.unwrap();
         let mb = b.recv().await.unwrap();
@@ -956,20 +968,12 @@ mod tests {
     async fn forbidden_action_replies_direct_not_broadcast() {
         let handle = spawn_room("ABCD", sets(), "tok", None);
         let mut bcast = handle.subscribe();
-        let (direct, mut direct_rx) = direct::channel();
-
-        handle
-            .dispatch(Command {
-                intent: ClientMsg::StartGame,
-                role: Role::Player,
-                name: Some("Ann".into()),
-                direct,
-            })
-            .await
-            .unwrap();
+        let (tx, mut rx) = direct::channel();
+        let intent = ClientMsg::StartGame;
+        dispatch_from(&handle, &tx, Role::Player, Some("Ann"), intent).await;
 
         // The originating connection gets a direct Forbidden error...
-        let err = direct_rx.recv().await.unwrap();
+        let err = rx.recv().await.unwrap();
         assert!(matches!(
             err,
             ServerMsg::Error {
@@ -979,25 +983,6 @@ mod tests {
         ));
         // ...and nothing is broadcast.
         assert!(bcast.try_recv().is_err());
-    }
-
-    /// Dispatch `intent` from a connection whose direct replies go to `direct`.
-    async fn dispatch_from(
-        handle: &RoomHandle,
-        direct: &DirectSender,
-        role: Role,
-        name: Option<&str>,
-        intent: ClientMsg,
-    ) {
-        handle
-            .dispatch(Command {
-                intent,
-                role,
-                name: name.map(String::from),
-                direct: direct.clone(),
-            })
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
@@ -1031,31 +1016,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), served)
             .await
             .expect("the room stopped serving other connections");
-    }
-
-    #[tokio::test]
-    async fn no_reply_after_an_overflow_reaches_the_connection() {
-        let handle = spawn_room("ABCD", sets(), "tok", None);
-        let (stalled, mut stalled_rx) = direct::channel();
-        let overflowed = stalled_rx.overflowed();
-        for _ in 0..=direct::DIRECT_REPLY_CAPACITY {
-            dispatch_from(&handle, &stalled, Role::Display, None, ClientMsg::Ping).await;
-        }
-        tokio::time::timeout(Duration::from_secs(2), overflowed)
-            .await
-            .expect("the overflow was not signalled");
-
-        // Reading one reply frees a slot, but a reply sent after the dropped
-        // pong must still not get through.
-        assert_eq!(stalled_rx.recv().await, Some(ServerMsg::Pong));
-        dispatch_from(&handle, &stalled, Role::Display, None, ClientMsg::Ping).await;
-        drop(stalled);
-        let mut delivered = 1;
-        while let Some(reply) = stalled_rx.recv().await {
-            assert_eq!(reply, ServerMsg::Pong);
-            delivered += 1;
-        }
-        assert_eq!(delivered, direct::DIRECT_REPLY_CAPACITY);
     }
 
     #[tokio::test]
