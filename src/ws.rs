@@ -10,6 +10,13 @@
 //! * **outbound**: merge the room's broadcast stream with this connection's
 //!   direct reply channel → write frames
 //!
+//! Once the join reaches a room, every reply meant only for this connection
+//! goes through its fixed-capacity [direct reply channel](crate::direct). If
+//! that channel overflows, the handler closes the socket at once rather than
+//! keep it open without the dropped reply. Before that, a rejected first frame
+//! or unknown room gets one error written straight to the socket, which then
+//! closes.
+//!
 //! A dropped connection simply stops sending intents. Because the authoritative
 //! state lives in the actor and only mutates on explicit intents, a player
 //! disconnecting mid-submission cannot corrupt the room — they can reconnect
@@ -21,9 +28,10 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use crate::app::AppState;
+use crate::direct;
 use crate::protocol::{ClientMsg, ErrorCode, Role, ServerMsg};
 use crate::room::{Command, RoomHandle};
 
@@ -83,7 +91,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Subscribe before joining so no broadcast between join and loop is missed.
     let mut events = handle.subscribe();
-    let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let (direct_tx, mut direct_rx) = direct::channel();
+    let overflowed = direct_rx.overflowed();
 
     // Forward the join to the actor; it validates the host token and replies
     // with Joined (+ initial state) or an Error over the direct channel.
@@ -140,36 +149,54 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     });
 
     // ---- 4. inbound loop: socket -> actor --------------------------------
-    while let Some(Ok(msg)) = stream.next().await {
-        match msg {
-            Message::Text(text) => match serde_json::from_str::<ClientMsg>(&text) {
-                Ok(intent) => {
-                    let cmd = Command {
-                        intent,
-                        role,
-                        name: name.clone(),
-                        direct: direct_tx.clone(),
-                    };
-                    if handle.dispatch(cmd).await.is_err() {
-                        break; // room gone
+    let inbound = async {
+        while let Some(Ok(msg)) = stream.next().await {
+            match msg {
+                Message::Text(text) => match serde_json::from_str::<ClientMsg>(&text) {
+                    Ok(intent) => {
+                        let cmd = Command {
+                            intent,
+                            role,
+                            name: name.clone(),
+                            direct: direct_tx.clone(),
+                        };
+                        if handle.dispatch(cmd).await.is_err() {
+                            break; // room gone
+                        }
                     }
-                }
-                Err(e) => {
-                    // Report the parse failure to this client only.
-                    let _ = direct_tx.send(ServerMsg::Error {
-                        code: ErrorCode::BadRequest,
-                        message: format!("could not parse message: {e}"),
-                    });
-                }
-            },
-            Message::Close(_) => break,
-            // Ping/Pong/Binary: ignore (axum auto-answers protocol pings).
-            _ => {}
+                    Err(e) => {
+                        // Report the parse failure to this client only.
+                        direct_tx.send(ServerMsg::Error {
+                            code: ErrorCode::BadRequest,
+                            message: format!("could not parse message: {e}"),
+                        });
+                    }
+                },
+                Message::Close(_) => break,
+                // Ping/Pong/Binary: ignore (axum auto-answers protocol pings).
+                _ => {}
+            }
         }
-    }
+    };
+    // ---- 5. read until the client leaves or a direct reply overflows -----
+    let overflow = tokio::select! {
+        // When both are ready the overflow wins, so the pump is aborted rather
+        // than drained into a client that stopped reading.
+        biased;
+        () = overflowed => true,
+        () = inbound => false,
+    };
 
-    // Inbound ended: dropping direct_tx closes the outbound pump.
-    drop(direct_tx);
+    if overflow {
+        // A reply was dropped, so close now. The pump may be stuck writing to
+        // a client that stopped reading: aborting it drops the sink, and
+        // returning drops the stream, which closes the socket.
+        outbound.abort();
+        tracing::warn!(%code, ?role, "direct reply channel overflowed; closing connection");
+    } else {
+        // Inbound ended: dropping direct_tx closes the outbound pump.
+        drop(direct_tx);
+    }
     let _ = outbound.await;
     tracing::debug!(%code, ?role, "connection closed");
 }

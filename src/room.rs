@@ -10,7 +10,9 @@
 //! * The actor reduces each command with the pure [`apply`] function, then fans
 //!   the resulting **broadcast** events out to every subscriber via a
 //!   `tokio::sync::broadcast` channel, and sends any **direct** (per-connection)
-//!   events back over the requester's own channel.
+//!   events back over the requester's own fixed-capacity
+//!   [direct reply channel](crate::direct). The actor never waits on that
+//!   channel: one that overflows closes its connection instead.
 //!
 //! Keeping the reducer pure ([`apply`] takes `&mut GameState` and returns a
 //! [`Reaction`]) means the entire command surface is unit-testable without
@@ -19,6 +21,7 @@
 use tokio::sync::{broadcast, mpsc};
 
 use crate::db::Db;
+use crate::direct::DirectSender;
 use crate::protocol::{
     ClientMsg, ErrorCode, PlayerStatus, Role, RoomSnapshot, ServerMsg,
 };
@@ -37,7 +40,7 @@ pub struct Command {
     pub role: Role,
     pub name: Option<String>,
     /// Channel for events meant only for the originating connection.
-    pub direct: mpsc::UnboundedSender<ServerMsg>,
+    pub direct: DirectSender,
 }
 
 /// A durable side effect for the actor to run against the database, produced by
@@ -142,8 +145,9 @@ async fn run(
             let _ = events_tx.send(msg);
         }
         for msg in reaction.direct {
-            // Errs only if the originating connection has gone away.
-            let _ = cmd.direct.send(msg);
+            // Never waits, so one connection's full channel cannot hold up
+            // the room; the overflow closes that connection instead.
+            cmd.direct.send(msg);
         }
         for effect in reaction.effects {
             run_effect(&db, &state.code, effect).await;
@@ -488,7 +492,9 @@ fn transition_error(e: TransitionError) -> ServerMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::direct;
     use crate::state::{Phase, PromptSet, TransitionError};
+    use std::time::Duration;
 
     fn sets() -> Vec<PromptSet> {
         vec![PromptSet {
@@ -923,7 +929,7 @@ mod tests {
         let mut a = handle.subscribe();
         let mut b = handle.subscribe();
 
-        let (direct, _direct_rx) = mpsc::unbounded_channel();
+        let (direct, _direct_rx) = direct::channel();
         handle
             .dispatch(Command {
                 intent: ClientMsg::AddPlayer { name: "Ann".into() },
@@ -950,7 +956,7 @@ mod tests {
     async fn forbidden_action_replies_direct_not_broadcast() {
         let handle = spawn_room("ABCD", sets(), "tok", None);
         let mut bcast = handle.subscribe();
-        let (direct, mut direct_rx) = mpsc::unbounded_channel();
+        let (direct, mut direct_rx) = direct::channel();
 
         handle
             .dispatch(Command {
@@ -973,5 +979,130 @@ mod tests {
         ));
         // ...and nothing is broadcast.
         assert!(bcast.try_recv().is_err());
+    }
+
+    /// Dispatch `intent` from a connection whose direct replies go to `direct`.
+    async fn dispatch_from(
+        handle: &RoomHandle,
+        direct: &DirectSender,
+        role: Role,
+        name: Option<&str>,
+        intent: ClientMsg,
+    ) {
+        handle
+            .dispatch(Command {
+                intent,
+                role,
+                name: name.map(String::from),
+                direct: direct.clone(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_full_direct_reply_channel_does_not_stall_the_room() {
+        let handle = spawn_room("ABCD", sets(), "tok", None);
+        let mut events = handle.subscribe();
+
+        // Never read: one more ping than the channel holds overflows it.
+        let (stalled, _stalled_rx) = direct::channel();
+        for _ in 0..=direct::DIRECT_REPLY_CAPACITY {
+            dispatch_from(&handle, &stalled, Role::Display, None, ClientMsg::Ping).await;
+        }
+
+        let (other, mut other_rx) = direct::channel();
+        dispatch_from(&handle, &other, Role::Display, None, ClientMsg::Ping).await;
+        dispatch_from(
+            &handle,
+            &other,
+            Role::Host,
+            None,
+            ClientMsg::AddPlayer { name: "Ann".into() },
+        )
+        .await;
+        let served = async {
+            assert_eq!(other_rx.recv().await, Some(ServerMsg::Pong));
+            assert!(matches!(
+                events.recv().await,
+                Ok(ServerMsg::RoomState { room }) if room.players.len() == 1
+            ));
+        };
+        tokio::time::timeout(Duration::from_secs(2), served)
+            .await
+            .expect("the room stopped serving other connections");
+    }
+
+    #[tokio::test]
+    async fn no_reply_after_an_overflow_reaches_the_connection() {
+        let handle = spawn_room("ABCD", sets(), "tok", None);
+        let (stalled, mut stalled_rx) = direct::channel();
+        let overflowed = stalled_rx.overflowed();
+        for _ in 0..=direct::DIRECT_REPLY_CAPACITY {
+            dispatch_from(&handle, &stalled, Role::Display, None, ClientMsg::Ping).await;
+        }
+        tokio::time::timeout(Duration::from_secs(2), overflowed)
+            .await
+            .expect("the overflow was not signalled");
+
+        // Reading one reply frees a slot, but a reply sent after the dropped
+        // pong must still not get through.
+        assert_eq!(stalled_rx.recv().await, Some(ServerMsg::Pong));
+        dispatch_from(&handle, &stalled, Role::Display, None, ClientMsg::Ping).await;
+        drop(stalled);
+        let mut delivered = 1;
+        while let Some(reply) = stalled_rx.recv().await {
+            assert_eq!(reply, ServerMsg::Pong);
+            delivered += 1;
+        }
+        assert_eq!(delivered, direct::DIRECT_REPLY_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn a_player_rejoining_mid_performance_gets_every_direct_reply() {
+        let handle = spawn_room("ABCD", sets(), "tok", None);
+        let (setup, _setup_rx) = direct::channel();
+        let open_round = [
+            ClientMsg::AddPlayer { name: "Ann".into() },
+            ClientMsg::AddPlayer { name: "Bo".into() },
+            ClientMsg::StartCollecting,
+        ];
+        for intent in open_round {
+            dispatch_from(&handle, &setup, Role::Host, None, intent).await;
+        }
+        for name in ["Ann", "Bo"] {
+            let intent = ClientMsg::SubmitResponses {
+                responses: vec!["x".into(); 2],
+                signoff: "s".into(),
+            };
+            dispatch_from(&handle, &setup, Role::Player, Some(name), intent).await;
+        }
+        dispatch_from(&handle, &setup, Role::Host, None, ClientMsg::StartGame).await;
+
+        let (player, mut player_rx) = direct::channel();
+        let rejoin = ClientMsg::JoinRoom {
+            code: "ABCD".into(),
+            role: Role::Player,
+            name: Some("Ann".into()),
+            token: None,
+        };
+        dispatch_from(&handle, &player, Role::Player, Some("Ann"), rejoin).await;
+        drop(player);
+        let mut replies = Vec::new();
+        while let Some(reply) = player_rx.recv().await {
+            replies.push(reply);
+        }
+        assert!(
+            matches!(
+                replies.as_slice(),
+                [
+                    ServerMsg::Joined { .. },
+                    ServerMsg::RoomState { room },
+                    ServerMsg::SubmissionProgress { submitted: 2, total: 2, .. },
+                    ServerMsg::SlideChanged { index: 0, .. },
+                ] if room.phase == Phase::Performing
+            ),
+            "{replies:?}"
+        );
     }
 }

@@ -7,14 +7,14 @@
 //!   set -a; . ./.env; set +a; cargo test --test persistence -- --nocapture
 
 use channel_zero::db::Db;
+use channel_zero::direct;
 use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
 use channel_zero::registry::Registry;
 use channel_zero::room::{Command, RoomHandle};
-use tokio::sync::mpsc;
 
 /// Dispatch an intent as a given role/name with a throwaway direct channel.
 async fn fire(handle: &RoomHandle, intent: ClientMsg, role: Role, name: Option<&str>) {
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = direct::channel();
     handle
         .dispatch(Command {
             intent,
@@ -30,7 +30,7 @@ async fn fire(handle: &RoomHandle, intent: ClientMsg, role: Role, name: Option<&
 /// awaits their durable effects) strictly in order, a returned Pong guarantees
 /// every previously dispatched command — and its persistence — has completed.
 async fn barrier(handle: &RoomHandle) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = direct::channel();
     handle
         .dispatch(Command {
             intent: ClientMsg::Ping,
@@ -79,7 +79,7 @@ async fn final_responses_and_archive_persist_to_postgres() {
 
     // Each player joins, learns their prompt count from the assignment, submits.
     for name in ["Ann", "Bo"] {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = direct::channel();
         handle
             .dispatch(Command {
                 intent: ClientMsg::JoinRoom {

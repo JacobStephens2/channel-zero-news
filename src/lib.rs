@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod db;
+pub mod direct;
 pub mod error;
 pub mod protocol;
 pub mod registry;
