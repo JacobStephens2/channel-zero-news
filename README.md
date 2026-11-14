@@ -33,6 +33,7 @@ channel-zero/
     ├── routes.rs        REST: create/join room, prompt sets
     ├── ws.rs            WebSocket upgrade + per-connection handler
     ├── room.rs          per-room actor (owns state) + broadcast fan-out + pure reducer
+    ├── direct.rs        per-connection direct reply channel (fixed capacity)
     ├── registry.rs      in-memory map of live rooms by join code
     ├── state.rs         GameState machine (lobby→collecting→performing→archived)
     ├── protocol.rs      serde message enums (client intents ↔ server events)
@@ -50,7 +51,10 @@ the actor reduces each with a pure function and:
 * fans **broadcast** events (room state, submission progress, slide changes) out
   to every subscriber via a `tokio::sync::broadcast` channel, and
 * sends **direct** events (your assignment, errors, pong) back to just the
-  originating connection.
+  originating connection, over that connection's fixed-capacity direct reply
+  channel. The actor never waits on it: a connection whose channel overflows
+  is closed instead, so a client that stops reading cannot stall the room or
+  stay open after missing a reply.
 
 The server is the single source of truth. Clients render state and send intents;
 they never send state.

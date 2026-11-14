@@ -2,12 +2,17 @@
 //! create room (REST) -> host adds players -> open submissions -> players
 //! submit -> start game -> advance slides -> archive. Exercises host/player/
 //! display roles and server-side host enforcement against the live router.
+//! Also covers rejected joins and closing a socket that stops reading its
+//! direct replies.
+
+use std::time::Duration;
 
 use channel_zero::app::{build_router, AppState};
 use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
-use channel_zero::state::{Phase, PromptSet, Slide};
+use channel_zero::state::{Phase, PromptSet, Slide, MAX_PLAYER_NAME_CHARS, MAX_ROSTER_PLAYERS};
 use futures_util::SinkExt;
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 #[path = "common/mod.rs"]
@@ -87,13 +92,9 @@ async fn connect(addr: &str) -> Ws {
     ws
 }
 
-#[tokio::test]
-async fn full_game_over_websocket() {
-    let addr = spawn_server().await;
-    let http = reqwest::Client::new();
-
-    // ---- create a room over REST ----
-    let created: serde_json::Value = http
+/// Create a room over REST, returning its join code and host token.
+async fn create_room(addr: &str) -> (String, String) {
+    let created: serde_json::Value = reqwest::Client::new()
         .post(format!("http://{addr}/api/rooms"))
         .send()
         .await
@@ -101,13 +102,38 @@ async fn full_game_over_websocket() {
         .json()
         .await
         .unwrap();
-    let code = created["code"].as_str().unwrap().to_string();
-    let host_token = created["host_token"].as_str().unwrap().to_string();
+    (
+        created["code"].as_str().unwrap().to_string(),
+        created["host_token"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Connect and send `msg`, a `JoinRoom`, returning the socket once the server
+/// acknowledges the role it asked for.
+async fn join(addr: &str, msg: &ClientMsg) -> Ws {
+    let ClientMsg::JoinRoom { role, .. } = msg else {
+        panic!("join needs a JoinRoom message, got {msg:?}");
+    };
+    let mut ws = connect(addr).await;
+    send(&mut ws, msg).await;
+    let joined = recv_until(&mut ws, |m| matches!(m, ServerMsg::Joined { .. })).await;
+    assert!(
+        matches!(joined, ServerMsg::Joined { role: acked, .. } if acked == *role),
+        "asked to join as {role:?}, got {joined:?}"
+    );
+    ws
+}
+
+#[tokio::test]
+async fn full_game_over_websocket() {
+    let addr = spawn_server().await;
+
+    // ---- create a room over REST ----
+    let (code, host_token) = create_room(&addr).await;
 
     // ---- host joins ----
-    let mut host = connect(&addr).await;
-    send(
-        &mut host,
+    let mut host = join(
+        &addr,
         &ClientMsg::JoinRoom {
             code: code.clone(),
             role: Role::Host,
@@ -116,8 +142,6 @@ async fn full_game_over_websocket() {
         },
     )
     .await;
-    let joined = recv_until(&mut host, |m| matches!(m, ServerMsg::Joined { .. })).await;
-    assert!(matches!(joined, ServerMsg::Joined { role: Role::Host, .. }));
 
     // ---- host builds the roster ----
     for name in ["Ann", "Bo"] {
@@ -130,9 +154,8 @@ async fn full_game_over_websocket() {
     .await;
 
     // ---- display screen joins (read-only) ----
-    let mut display = connect(&addr).await;
-    send(
-        &mut display,
+    let mut display = join(
+        &addr,
         &ClientMsg::JoinRoom {
             code: code.clone(),
             role: Role::Display,
@@ -141,7 +164,6 @@ async fn full_game_over_websocket() {
         },
     )
     .await;
-    recv_until(&mut display, |m| matches!(m, ServerMsg::Joined { .. })).await;
 
     // ---- a display screen must NOT be able to drive the game ----
     send(&mut display, &ClientMsg::StartCollecting).await;
@@ -237,16 +259,7 @@ async fn full_game_over_websocket() {
 #[tokio::test]
 async fn host_join_with_bad_token_is_rejected() {
     let addr = spawn_server().await;
-    let http = reqwest::Client::new();
-    let created: serde_json::Value = http
-        .post(format!("http://{addr}/api/rooms"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let code = created["code"].as_str().unwrap().to_string();
+    let (code, _host_token) = create_room(&addr).await;
 
     let mut host = connect(&addr).await;
     send(
@@ -283,4 +296,84 @@ async fn joining_unknown_room_errors() {
     assert!(
         matches!(err, ServerMsg::Error { code, .. } if code == channel_zero::protocol::ErrorCode::UnknownRoom)
     );
+}
+
+/// Unread rejoins sent before the test switches to pings. With a full roster
+/// each rejoin queues about 100 KB of replies, so 1,000 overrun the socket
+/// buffers many times over, yet a server that never closes the socket holds
+/// only about 100 MB before this test fails.
+const UNREAD_REJOINS: usize = 1_000;
+
+/// A distinct roster name of `MAX_PLAYER_NAME_CHARS` characters, almost all
+/// four bytes long, so a full roster makes each room state reply large.
+fn longest_name(i: usize) -> String {
+    let prefix = format!("{i:02}");
+    let fill = MAX_PLAYER_NAME_CHARS - prefix.len();
+    prefix + &"\u{1F4FA}".repeat(fill)
+}
+
+fn is_full_roster(msg: &ServerMsg) -> bool {
+    matches!(msg, ServerMsg::RoomState { room } if room.players.len() == MAX_ROSTER_PLAYERS)
+}
+
+#[tokio::test]
+async fn a_socket_that_stops_reading_is_closed_while_the_room_serves_others() {
+    let addr = spawn_server().await;
+    let (code, host_token) = create_room(&addr).await;
+
+    let mut host = join(
+        &addr,
+        &ClientMsg::JoinRoom {
+            code: code.clone(),
+            role: Role::Host,
+            name: None,
+            token: Some(host_token),
+        },
+    )
+    .await;
+    for i in 0..MAX_ROSTER_PLAYERS {
+        let name = longest_name(i);
+        send(&mut host, &ClientMsg::AddPlayer { name }).await;
+    }
+    recv_until(&mut host, is_full_roster).await;
+
+    // A display join replies directly with joined, room state and progress.
+    let display_join = ClientMsg::JoinRoom {
+        code: code.clone(),
+        role: Role::Display,
+        name: None,
+        token: None,
+    };
+    let mut stalled = join(&addr, &display_join).await;
+
+    // Keep sending without ever reading again, until the server closes the
+    // socket and a send fails.
+    let rejoin = Message::Text(serde_json::to_string(&display_join).unwrap());
+    let ping = Message::Text(serde_json::to_string(&ClientMsg::Ping).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut sent = 0;
+    loop {
+        let frame = if sent < UNREAD_REJOINS {
+            rejoin.clone()
+        } else {
+            ping.clone()
+        };
+        if stalled.send(frame).await.is_err() {
+            break;
+        }
+        sent += 1;
+        assert!(
+            Instant::now() < deadline,
+            "the server kept the socket open after {sent} intents whose replies were never read"
+        );
+        if sent >= UNREAD_REJOINS {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    // The room still answers its host and admits a new socket.
+    send(&mut host, &ClientMsg::Ping).await;
+    recv_until(&mut host, |m| matches!(m, ServerMsg::Pong)).await;
+    let mut display = join(&addr, &display_join).await;
+    recv_until(&mut display, is_full_roster).await;
 }
