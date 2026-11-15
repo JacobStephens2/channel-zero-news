@@ -84,6 +84,27 @@ intents, so a player can disconnect mid-submission and reconnect to resubmit.
 Database writes are best-effort side effects — a DB failure is logged and never
 breaks the in-memory game.
 
+### Room retention
+
+Rooms live only in memory, so the registry (`src/registry.rs`) removes each
+one at the first of three deadlines:
+
+* **Host join:** a room whose host join is not acknowledged within 500 ms of
+  creation (`IDLE_WITHOUT_SOCKET`) is removed, even with display or player
+  sockets attached.
+* **No socket:** once its host has joined, any socket keeps the room; it is
+  removed 500 ms after the last one closes.
+* **Activity:** a room with no room activity for 2 hours
+  (`IDLE_WITHOUT_ACTIVITY`), counted from creation or its last activity, is
+  removed even with sockets attached. Room activity is an intent the room
+  accepts and broadcasts as a state change; pings, joins that add no player
+  and rejected intents don't count.
+
+Removal stops the room's actor. Every socket still attached gets
+`unknown_room` as its last frame and is closed, and the client clears its
+recovery record. Creation retains at most 128 live rooms (`MAX_LIVE_ROOMS`)
+and answers 503 past that.
+
 ## REST surface
 
 | Method | Path                 | Purpose                                   |
