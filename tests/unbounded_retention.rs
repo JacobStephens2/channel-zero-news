@@ -5,8 +5,8 @@
 //! `POST /api/rooms`: three empty creates, no WebSocket, one second later the
 //! registry count is 0. The HTTP body does not carry the count.
 //!
-//! The quota test serves the router as the binary does, with peer addresses,
-//! and sends what the local Apache forwards. The others serve it without peer
+//! The quota tests serve the router as the binary does, with peer addresses,
+//! and send what the local Apache forwards. The others serve it without peer
 //! addresses, so all their creates share one quota.
 
 use std::net::IpAddr;
@@ -88,23 +88,25 @@ fn http() -> reqwest::Client {
         .expect("client")
 }
 
-/// `POST /api/rooms` carrying `forwarded_for` as its `X-Forwarded-For`.
+/// `POST /api/rooms` carrying `forwarded_for` as its `X-Forwarded-For`. Bytes,
+/// because Apache forwards a client's own header bytes unchanged.
 async fn create_from(
     http: &reqwest::Client,
     url: &str,
-    forwarded_for: &str,
+    forwarded_for: &[u8],
 ) -> (reqwest::StatusCode, serde_json::Value) {
+    let shown = forwarded_for.escape_ascii();
     let response = http
         .post(url)
         .header("x-forwarded-for", forwarded_for)
         .send()
         .await
-        .unwrap_or_else(|e| panic!("create from {forwarded_for:?} failed: {e}"));
+        .unwrap_or_else(|e| panic!("create from {shown} failed: {e}"));
     let status = response.status();
     let body = response
         .json()
         .await
-        .unwrap_or_else(|e| panic!("create from {forwarded_for:?} body: {e}"));
+        .unwrap_or_else(|e| panic!("create from {shown} body: {e}"));
     (status, body)
 }
 
@@ -256,7 +258,7 @@ async fn one_forwarded_address_creates_eight_rooms_then_gets_429_while_another_s
     for n in 1..=8 {
         // The client's own leading entry changes; the one Apache appends does not.
         let forwarded_for = format!("198.51.100.{n}, 203.0.113.7");
-        let (status, body) = create_from(&http, &url, &forwarded_for).await;
+        let (status, body) = create_from(&http, &url, forwarded_for.as_bytes()).await;
         assert!(
             status.is_success(),
             "create {n} status {status} body {body}"
@@ -272,7 +274,7 @@ async fn one_forwarded_address_creates_eight_rooms_then_gets_429_while_another_s
         );
     }
 
-    let (status, body) = create_from(&http, &url, "198.51.100.9, 203.0.113.7").await;
+    let (status, body) = create_from(&http, &url, b"198.51.100.9, 203.0.113.7").await;
     assert_eq!(
         status,
         reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -285,7 +287,7 @@ async fn one_forwarded_address_creates_eight_rooms_then_gets_429_while_another_s
     );
     assert_eq!(running.state.registry.count().await, 8);
 
-    let (status, body) = create_from(&http, &url, "203.0.113.8").await;
+    let (status, body) = create_from(&http, &url, b"203.0.113.8").await;
     assert!(
         status.is_success(),
         "other address status {status} body {body}"
@@ -294,5 +296,48 @@ async fn one_forwarded_address_creates_eight_rooms_then_gets_429_while_another_s
         body.get("code").is_some(),
         "other address missing code: {body}"
     );
+    drop(sockets);
+}
+
+#[tokio::test]
+async fn bytes_a_client_sends_before_the_entry_apache_appends_do_not_lift_its_quota() {
+    let running = spawn_server(Peers::Known).await;
+    let http = http();
+    let url = format!("http://{}/api/rooms", running.addr);
+    let mut sockets = Vec::new();
+    for n in 1..=8 {
+        let (status, body) = create_from(&http, &url, b"203.0.113.7").await;
+        assert!(
+            status.is_success(),
+            "create {n} status {status} body {body}"
+        );
+        let code = body["code"].as_str().expect("created code");
+        sockets.push(
+            running
+                .state
+                .registry
+                .open_socket(code)
+                .await
+                .expect("live room"),
+        );
+    }
+
+    // Apache forwards the client's own header bytes unchanged, non-ASCII
+    // included, and appends `, 203.0.113.7` after them on the same line.
+    let lines: [&[u8]; 3] = [
+        b"198.51.100.9, 203.0.113.7",
+        b"\xff, 203.0.113.7",
+        "é, 203.0.113.7".as_bytes(),
+    ];
+    for forwarded_for in lines {
+        let (status, body) = create_from(&http, &url, forwarded_for).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "{} body {body}",
+            forwarded_for.escape_ascii()
+        );
+    }
+    assert_eq!(running.state.registry.count().await, 8);
     drop(sockets);
 }

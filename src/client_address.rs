@@ -77,11 +77,13 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientAddress {
 }
 
 /// The last entry of the last `X-Forwarded-For` line, the one the local Apache
-/// appended, when it is an IP address.
+/// appended, when it is an IP address. Only that entry's bytes are decoded:
+/// Apache forwards the client's own entries unchanged, non-ASCII bytes
+/// included, so they must not decide whether the line parses.
 fn rightmost_forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
     let line = headers.get_all("x-forwarded-for").iter().next_back()?;
-    let entry = line.to_str().ok()?.rsplit(',').next()?;
-    entry.trim().parse().ok()
+    let entry = line.as_bytes().rsplit(|&byte| byte == b',').next()?;
+    std::str::from_utf8(entry).ok()?.trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -121,7 +123,19 @@ mod tests {
     fn from_the_local_apache_the_key_is_the_rightmost_forwarded_entry_not_a_client_supplied_one() {
         let mut separate_lines = forwarded_for("198.51.100.9");
         separate_lines.append("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
-        for headers in [forwarded_for("198.51.100.9, 203.0.113.7"), separate_lines] {
+        let mut obs_text = HeaderMap::new();
+        obs_text.insert(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"\xff, 203.0.113.7").unwrap(),
+        );
+        for headers in [
+            forwarded_for("198.51.100.9, 203.0.113.7"),
+            separate_lines,
+            // Apache forwards the client's own bytes unchanged, non-ASCII
+            // included, and appends its entry after them.
+            forwarded_for("é, 203.0.113.7"),
+            obs_text,
+        ] {
             assert_eq!(
                 ClientAddress::resolve(Some(ip("127.0.0.1")), &headers),
                 ClientAddress::key_for(ip("203.0.113.7")),
