@@ -31,7 +31,8 @@ channel-zero/
     ├── main.rs          binary: wire DB + router, serve
     ├── app.rs           AppState + router construction
     ├── routes.rs        REST: create/join room, prompt sets
-    ├── ws.rs            WebSocket upgrade + per-connection handler
+    ├── ws.rs            WebSocket upgrade + frame/JSON conversion
+    ├── connection.rs    Room connection admission, identity, delivery + termination
     ├── room.rs          per-room actor (owns state) + broadcast fan-out + pure reducer
     ├── direct.rs        per-connection direct reply channel (fixed capacity)
     ├── registry.rs      in-memory map of live rooms by join code
@@ -58,6 +59,32 @@ the actor reduces each with a pure function and:
 
 The server is the single source of truth. Clients render state and send intents;
 they never send state.
+
+`connection::run(registry, incoming, outgoing)` owns one Room connection. Both
+the WebSocket adapter and controlled in-process adapters supply a standard
+futures stream of parsed intents, malformed text or non-text frames, plus a
+sink of server events. Stream errors/end and sink errors end the attempt. The
+runner acquires the registry's existing socket guard, freezes the actor's
+acknowledged room/role/name, and dispatches later intents with that identity.
+Matching joins replay the snapshot; identity changes are forbidden, and host
+replays must still present the token.
+
+The actor publishes any self-registration events, creates a new broadcast
+subscription, and queues the complete join/replay snapshot at one serialized
+cut. Private delivery envelopes carry the subscription on the first actual
+reply and mark the final reply. They add no queue slots or JSON fields. The
+runner replaces the old subscription, discards its backlog and finishes the
+direct prefix before delivering post-cut broadcasts. Parser errors do not end
+a prefix. Direct replies take priority, including a readiness recheck before
+writing a selected broadcast. Broadcasts retain the 256-event lag/skip policy;
+direct traffic can delay that connection's broadcasts.
+
+Scoped input/output futures run under overflow and actor-closure supervision.
+Any terminal event cancels sibling work, including pending writes, and drops
+the guard; cancelling the runner does the same. No detached forwarding task
+keeps a socket alive. Creation limits and the 500 ms no-socket retention policy
+are unchanged. Room session, Player round participation and Performance stage
+remain tab-side owners with their current interfaces.
 
 ### Roles & authority
 
@@ -130,6 +157,16 @@ interface in `static/room-session.mjs`. The existing static router serves all th
 native modules directly; `tests/full_flow.rs` checks their production imports,
 URLs, source bodies, and JavaScript content types. The database test skips its
 DB assertions when `DATABASE_URL` is unset.
+
+`tests/room_connection.rs` drives the production runner with the real registry
+and actor. `tests/common/connection.rs` supplies a framed input stream and a
+gated server-event sink, so tests can queue room mutations while a specific
+write is pending and verify snapshots, replay, overflow isolation and guard
+release through the interface. `tests/persistence.rs` uses admitted host/player
+connections too; its Ping/Pong barrier still waits for earlier actor commands
+and their ordered durable effects. Pure reducer/game-transition tests and the
+focused direct-channel overflow test remain independent. `tests/full_flow.rs`
+retains real WebSocket framing, all-role, replay and overflow regressions.
 
 `static/player-round-participation.mjs` owns Player round participation. The entry
 constructs it once with the document and a sender that delegates to Room session,

@@ -1,5 +1,10 @@
 # Glossary
 
+**Room connection**: The server-side lifetime of one socket's attempt to join a
+retained room, its actor-acknowledged identity, same-identity replays, bounded
+direct replies, live broadcasts and termination; it owns neither a tab's Room
+session nor authoritative game state.
+
 **Room session**: a tab's current attempt to join one room with one role and
 optional player name, together with its acknowledged identity and per-tab
 recovery record; it does not own the room's authoritative game state.

@@ -15,8 +15,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::watch;
 
-use crate::protocol::ServerMsg;
-
 /// Replies one connection's channel holds before it overflows.
 ///
 /// A join is the largest set of direct replies: joined, room state, progress,
@@ -25,7 +23,7 @@ use crate::protocol::ServerMsg;
 pub const DIRECT_REPLY_CAPACITY: usize = 32;
 
 /// Create one connection's direct reply channel.
-pub fn channel() -> (DirectSender, DirectReceiver) {
+pub(crate) fn channel<T>() -> (DirectSender<T>, DirectReceiver<T>) {
     let (tx, rx) = mpsc::channel(DIRECT_REPLY_CAPACITY);
     let overflowed = Arc::new(watch::Sender::new(false));
     (
@@ -39,17 +37,29 @@ pub fn channel() -> (DirectSender, DirectReceiver) {
 
 /// The sending half. The connection clones it into every
 /// [`crate::room::Command`] it dispatches.
-#[derive(Clone)]
-pub struct DirectSender {
-    tx: mpsc::Sender<ServerMsg>,
+pub(crate) struct DirectSender<T> {
+    tx: mpsc::Sender<T>,
     overflowed: Arc<watch::Sender<bool>>,
 }
 
-impl DirectSender {
+impl<T> Clone for DirectSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            overflowed: Arc::clone(&self.overflowed),
+        }
+    }
+}
+
+impl<T> DirectSender<T> {
+    pub(crate) fn is_overflowed(&self) -> bool {
+        *self.overflowed.borrow()
+    }
+
     /// Queue a reply without waiting. A reply that finds the channel full
     /// overflows it, and every reply after an overflow is dropped too. A closed
     /// channel means the connection has already gone, so the reply is dropped.
-    pub fn send(&self, msg: ServerMsg) {
+    pub(crate) fn send(&self, msg: T) {
         // `send_if_modified` holds the watch lock for the whole closure, so for
         // every clone the overflow check, the enqueue and the overflow mark are
         // one step: a slot freed after an overflow cannot let a later reply in.
@@ -64,16 +74,24 @@ impl DirectSender {
 }
 
 /// The receiving half, owned by the connection handler.
-pub struct DirectReceiver {
-    rx: mpsc::Receiver<ServerMsg>,
+pub(crate) struct DirectReceiver<T> {
+    rx: mpsc::Receiver<T>,
     overflowed: Arc<watch::Sender<bool>>,
 }
 
-impl DirectReceiver {
+impl<T> DirectReceiver<T> {
+    pub(crate) fn is_overflowed(&self) -> bool {
+        *self.overflowed.borrow()
+    }
+
     /// The next reply, in the order they were sent. `None` once every sender
     /// is gone and the queued replies are delivered.
-    pub async fn recv(&mut self) -> Option<ServerMsg> {
+    pub(crate) async fn recv(&mut self) -> Option<T> {
         self.rx.recv().await
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
+        self.rx.try_recv()
     }
 
     /// Resolves once a reply has overflowed this channel. It does not borrow
@@ -93,7 +111,7 @@ impl DirectReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ErrorCode;
+    use crate::protocol::{ErrorCode, ServerMsg};
     use futures_util::FutureExt;
 
     fn numbered(i: usize) -> ServerMsg {
