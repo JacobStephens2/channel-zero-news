@@ -3,10 +3,10 @@
 
 use std::time::Duration;
 
-use channel_zero::protocol::ServerMsg;
-use futures_util::StreamExt;
+use channel_zero::protocol::{ClientMsg, ServerMsg};
+use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -35,4 +35,47 @@ where
             }
         }
     }
+}
+
+pub async fn send(ws: &mut Ws, msg: &ClientMsg) {
+    ws.send(Message::Text(serde_json::to_string(msg).unwrap()))
+        .await
+        .unwrap();
+}
+
+pub async fn connect(addr: &str) -> Ws {
+    let (ws, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+    ws
+}
+
+/// Create a room over REST, returning its join code and host token.
+pub async fn create_room(addr: &str) -> (String, String) {
+    let created: serde_json::Value = reqwest::Client::new()
+        .post(format!("http://{addr}/api/rooms"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (
+        created["code"].as_str().unwrap().to_string(),
+        created["host_token"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Connect and send `msg`, a `JoinRoom`, returning the socket once the server
+/// acknowledges the role it asked for.
+pub async fn join(addr: &str, msg: &ClientMsg) -> Ws {
+    let ClientMsg::JoinRoom { role, .. } = msg else {
+        panic!("join needs a JoinRoom message, got {msg:?}");
+    };
+    let mut ws = connect(addr).await;
+    send(&mut ws, msg).await;
+    let joined = recv_until(&mut ws, |m| matches!(m, ServerMsg::Joined { .. })).await;
+    assert!(
+        matches!(joined, ServerMsg::Joined { role: acked, .. } if acked == *role),
+        "asked to join as {role:?}, got {joined:?}"
+    );
+    ws
 }

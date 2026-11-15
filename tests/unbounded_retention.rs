@@ -1,4 +1,5 @@
-//! Live-room retention: a cap, and removal when no socket is attached.
+//! Live-room retention: a cap, removal of a room whose host never joins, and
+//! removal when no socket is attached.
 //!
 //! The no-socket case is the security reproduction for anonymous
 //! `POST /api/rooms`: three empty creates, no WebSocket, one second later the
@@ -7,16 +8,17 @@
 use std::time::Duration;
 
 use channel_zero::app::{build_router, AppState};
-use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
-use channel_zero::registry::MAX_LIVE_ROOMS;
+use channel_zero::protocol::{ClientMsg, ErrorCode, Role, ServerMsg};
+use channel_zero::registry::{IDLE_WITHOUT_SOCKET, MAX_LIVE_ROOMS};
 use channel_zero::state::PromptSet;
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
+use tokio::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[path = "common/mod.rs"]
 mod common;
 
-use common::recv_until;
+use common::{create_room, join, recv_until, send, Ws};
 
 fn prompt_sets() -> Vec<PromptSet> {
     vec![PromptSet {
@@ -68,6 +70,27 @@ fn http() -> reqwest::Client {
         .timeout(Duration::from_secs(2))
         .build()
         .expect("client")
+}
+
+fn display_join(code: &str) -> ClientMsg {
+    ClientMsg::JoinRoom {
+        code: code.to_string(),
+        role: Role::Display,
+        name: None,
+        token: None,
+    }
+}
+
+/// The server has closed `ws`: the next read ends the stream instead of
+/// returning a frame.
+async fn assert_closed(ws: &mut Ws) {
+    let next = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("the socket was still open");
+    assert!(
+        matches!(next, None | Some(Err(_)) | Some(Ok(Message::Close(_)))),
+        "expected the socket to close, got {next:?}"
+    );
 }
 
 #[tokio::test]
@@ -168,6 +191,59 @@ async fn a_joined_socket_keeps_the_room_and_closing_it_lets_the_deadline_remove_
 }
 
 #[tokio::test]
+async fn a_room_whose_host_never_joins_is_removed_at_its_creation_deadline_and_its_socket_closed() {
+    let running = spawn_server().await;
+    let created_at = Instant::now();
+    let (code, _host_token) = create_room(&running.addr).await;
+    // A non-host join succeeds before the deadline but does not keep the room.
+    let mut display = join(&running.addr, &display_join(&code)).await;
+
+    let error = recv_until(&mut display, |msg| matches!(msg, ServerMsg::Error { .. })).await;
+    assert!(
+        matches!(
+            error,
+            ServerMsg::Error {
+                code: ErrorCode::UnknownRoom,
+                ..
+            }
+        ),
+        "expected unknown_room once the room was removed, got {error:?}"
+    );
+    assert!(
+        created_at.elapsed() >= IDLE_WITHOUT_SOCKET,
+        "the room was removed before its creation deadline"
+    );
+    assert_closed(&mut display).await;
+    assert!(running.state.registry.get(&code).await.is_none());
+}
+
+#[tokio::test]
+async fn a_hosted_room_stays_while_a_non_host_socket_remains_after_the_host_leaves() {
+    let running = spawn_server().await;
+    let (code, host_token) = create_room(&running.addr).await;
+    let host_join = ClientMsg::JoinRoom {
+        code: code.clone(),
+        role: Role::Host,
+        name: None,
+        token: Some(host_token),
+    };
+    let mut host = join(&running.addr, &host_join).await;
+    let mut display = join(&running.addr, &display_join(&code)).await;
+
+    host.close(None).await.unwrap();
+    drop(host);
+    // Past the creation deadline, and past the idle deadline the host's close
+    // would have started had it been the last socket.
+    tokio::time::sleep(IDLE_WITHOUT_SOCKET + Duration::from_millis(300)).await;
+    assert!(
+        running.state.registry.get(&code).await.is_some(),
+        "the display's socket should keep a room whose host joined"
+    );
+    send(&mut display, &ClientMsg::Ping).await;
+    recv_until(&mut display, |msg| matches!(msg, ServerMsg::Pong)).await;
+}
+
+#[tokio::test]
 async fn create_past_the_cap_returns_unavailable_and_retains_nothing() {
     let running = spawn_server().await;
     let mut sockets = Vec::new();
@@ -178,14 +254,15 @@ async fn create_past_the_cap_returns_unavailable_and_retains_nothing() {
             .create_room(prompt_sets(), None)
             .await
             .expect("room under the cap");
-        sockets.push(
-            running
-                .state
-                .registry
-                .open_socket(&room.code)
-                .await
-                .expect("socket under the cap"),
-        );
+        let (handle, socket) = running
+            .state
+            .registry
+            .open_socket(&room.code)
+            .await
+            .expect("socket under the cap");
+        // As the connection handler does once a host join is acknowledged.
+        socket.host_joined();
+        sockets.push((handle, socket));
     }
     assert_eq!(running.state.registry.count().await, MAX_LIVE_ROOMS);
 

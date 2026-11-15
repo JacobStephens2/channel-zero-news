@@ -13,10 +13,14 @@
 //!   events back over the requester's own fixed-capacity
 //!   [direct reply channel](crate::direct). The actor never waits on that
 //!   channel: one that overflows closes its connection instead.
+//! * The actor stops when the registry removes the room, even while
+//!   connections still hold handles; [`RoomHandle::closed`] tells them.
 //!
 //! Keeping the reducer pure ([`apply`] takes `&mut GameState` and returns a
 //! [`Reaction`]) means the entire command surface is unit-testable without
 //! spinning up tasks or sockets.
+
+use std::future::Future;
 
 use tokio::sync::{broadcast, mpsc};
 
@@ -98,15 +102,26 @@ impl RoomHandle {
     pub async fn dispatch(&self, cmd: Command) -> Result<(), RoomClosed> {
         self.cmd_tx.send(cmd).await.map_err(|_| RoomClosed)
     }
+
+    /// Resolves once the actor has stopped, as it does when the registry
+    /// removes the room. Every later [`Self::dispatch`] returns [`RoomClosed`].
+    pub async fn closed(&self) {
+        self.cmd_tx.closed().await;
+    }
 }
 
 /// Spawn a room actor and return a handle to it. `db` is `None` in tests and
 /// no-database runs, in which case durable effects are simply skipped.
+///
+/// The actor stops once `stop` resolves, even while handles are still held,
+/// and drops any commands still queued; the registry resolves it when it
+/// removes the room. Otherwise the actor stops once every handle is gone.
 pub fn spawn_room(
     code: impl Into<String>,
     prompt_sets: Vec<PromptSet>,
     host_token: impl Into<String>,
     db: Option<Db>,
+    stop: impl Future<Output = ()> + Send + 'static,
 ) -> RoomHandle {
     let code = code.into();
     let host_token = host_token.into();
@@ -114,7 +129,14 @@ pub fn spawn_room(
     let (events_tx, _events_rx) = broadcast::channel(BROADCAST_BUFFER);
 
     let state = GameState::new(code.clone(), prompt_sets);
-    tokio::spawn(run(state, host_token.clone(), cmd_rx, events_tx.clone(), db));
+    tokio::spawn(run(
+        state,
+        host_token.clone(),
+        cmd_rx,
+        events_tx.clone(),
+        db,
+        stop,
+    ));
 
     RoomHandle {
         code,
@@ -131,8 +153,17 @@ async fn run(
     mut cmd_rx: mpsc::Receiver<Command>,
     events_tx: broadcast::Sender<ServerMsg>,
     db: Option<Db>,
+    stop: impl Future<Output = ()>,
 ) {
-    while let Some(cmd) = cmd_rx.recv().await {
+    tokio::pin!(stop);
+    loop {
+        let next = tokio::select! {
+            // A stopped room takes no further command, even one already queued.
+            biased;
+            () = &mut stop => None,
+            cmd = cmd_rx.recv() => cmd,
+        };
+        let Some(cmd) = next else { break };
         let reaction = apply(
             &mut state,
             &host_token,
@@ -944,7 +975,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_subscribers_receive_the_same_broadcast() {
-        let handle = spawn_room("ABCD", sets(), "tok", None);
+        let handle = spawn_room("ABCD", sets(), "tok", None, std::future::pending());
         let mut a = handle.subscribe();
         let mut b = handle.subscribe();
 
@@ -966,7 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn forbidden_action_replies_direct_not_broadcast() {
-        let handle = spawn_room("ABCD", sets(), "tok", None);
+        let handle = spawn_room("ABCD", sets(), "tok", None, std::future::pending());
         let mut bcast = handle.subscribe();
         let (tx, mut rx) = direct::channel();
         let intent = ClientMsg::StartGame;
@@ -987,7 +1018,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_full_direct_reply_channel_does_not_stall_the_room() {
-        let handle = spawn_room("ABCD", sets(), "tok", None);
+        let handle = spawn_room("ABCD", sets(), "tok", None, std::future::pending());
         let mut events = handle.subscribe();
 
         // Never read: one more ping than the channel holds overflows it.
@@ -1020,7 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_player_rejoining_mid_performance_gets_every_direct_reply() {
-        let handle = spawn_room("ABCD", sets(), "tok", None);
+        let handle = spawn_room("ABCD", sets(), "tok", None, std::future::pending());
         let (setup, _setup_rx) = direct::channel();
         let open_round = [
             ClientMsg::AddPlayer { name: "Ann".into() },

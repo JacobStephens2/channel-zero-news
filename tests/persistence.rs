@@ -6,10 +6,12 @@
 //! suite stays hermetic. Run with:
 //!   set -a; . ./.env; set +a; cargo test --test persistence -- --nocapture
 
+use std::sync::Arc;
+
 use channel_zero::db::Db;
 use channel_zero::direct;
 use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
-use channel_zero::registry::Registry;
+use channel_zero::registry::{LiveSocket, NewRoom, Registry};
 use channel_zero::room::{Command, RoomHandle};
 
 /// Dispatch an intent as a given role/name with a throwaway direct channel.
@@ -24,6 +26,34 @@ async fn fire(handle: &RoomHandle, intent: ClientMsg, role: Role, name: Option<&
         })
         .await
         .unwrap();
+}
+
+/// Attach a socket and join it as the host, as the connection handler does, so
+/// the room outlives its creation deadline while the test drives the actor.
+async fn join_host(registry: &Arc<Registry>, room: &NewRoom) -> (RoomHandle, LiveSocket) {
+    let (handle, socket) = registry.open_socket(&room.code).await.expect("open socket");
+    let (tx, mut rx) = direct::channel();
+    handle
+        .dispatch(Command {
+            intent: ClientMsg::JoinRoom {
+                code: room.code.clone(),
+                role: Role::Host,
+                name: None,
+                token: Some(room.host_token.clone()),
+            },
+            role: Role::Host,
+            name: None,
+            direct: tx,
+        })
+        .await
+        .unwrap();
+    match rx.recv().await {
+        Some(ServerMsg::Joined {
+            role: Role::Host, ..
+        }) => socket.host_joined(),
+        other => panic!("host join was not acknowledged: {other:?}"),
+    }
+    (handle, socket)
 }
 
 /// Send a Ping and await the Pong. Because the actor processes commands (and
@@ -69,7 +99,7 @@ async fn final_responses_and_archive_persist_to_postgres() {
         .await
         .expect("create room");
     let code = room.code.clone();
-    let handle = registry.get(&code).await.unwrap();
+    let (handle, _host_socket) = join_host(&registry, &room).await;
 
     // Host builds the roster and opens submissions.
     for name in ["Ann", "Bo"] {
