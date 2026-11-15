@@ -1,4 +1,4 @@
-//! Database-backed persistence test. Drives a room's actor directly and asserts
+//! Database-backed persistence test. Drives admitted Room connections and asserts
 //! that finalized responses and archives land in Postgres, while live state
 //! stays in memory.
 //!
@@ -7,47 +7,13 @@
 //!   set -a; . ./.env; set +a; cargo test --test persistence -- --nocapture
 
 use channel_zero::db::Db;
-use channel_zero::direct;
 use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
 use channel_zero::registry::Registry;
-use channel_zero::room::{Command, RoomHandle};
 
-/// Dispatch an intent as a given role/name with a throwaway direct channel.
-async fn fire(handle: &RoomHandle, intent: ClientMsg, role: Role, name: Option<&str>) {
-    let (tx, _rx) = direct::channel();
-    handle
-        .dispatch(Command {
-            intent,
-            role,
-            name: name.map(String::from),
-            direct: tx,
-        })
-        .await
-        .unwrap();
-}
-
-/// Send a Ping and await the Pong. Because the actor processes commands (and
-/// awaits their durable effects) strictly in order, a returned Pong guarantees
-/// every previously dispatched command — and its persistence — has completed.
-async fn barrier(handle: &RoomHandle) {
-    let (tx, mut rx) = direct::channel();
-    handle
-        .dispatch(Command {
-            intent: ClientMsg::Ping,
-            role: Role::Display,
-            name: None,
-            direct: tx,
-        })
-        .await
-        .unwrap();
-    loop {
-        match rx.recv().await {
-            Some(ServerMsg::Pong) => return,
-            Some(_) => continue,
-            None => panic!("actor closed before pong"),
-        }
-    }
-}
+#[path = "common/connection.rs"]
+#[allow(dead_code)]
+mod connection;
+use connection::{join, Connection};
 
 #[tokio::test]
 async fn final_responses_and_archive_persist_to_postgres() {
@@ -69,66 +35,47 @@ async fn final_responses_and_archive_persist_to_postgres() {
         .await
         .expect("create room");
     let code = room.code.clone();
-    let handle = registry.get(&code).await.unwrap();
+    let mut host = Connection::admit(&registry, join(&room, Role::Host, None)).await;
 
     // Host builds the roster and opens submissions.
     for name in ["Ann", "Bo"] {
-        fire(&handle, ClientMsg::AddPlayer { name: name.into() }, Role::Host, None).await;
+        host.send(ClientMsg::AddPlayer { name: name.into() }).await;
     }
-    fire(&handle, ClientMsg::StartCollecting, Role::Host, None).await;
+    host.send(ClientMsg::StartCollecting).await;
+    host.barrier().await;
 
     // Each player joins, learns their prompt count from the assignment, submits.
     for name in ["Ann", "Bo"] {
-        let (tx, mut rx) = direct::channel();
-        handle
-            .dispatch(Command {
-                intent: ClientMsg::JoinRoom {
-                    code: code.clone(),
-                    role: Role::Player,
-                    name: Some(name.into()),
-                    token: None,
-                },
-                role: Role::Player,
-                name: Some(name.into()),
-                direct: tx,
-            })
-            .await
-            .unwrap();
-
-        let prompt_count = loop {
-            match rx.recv().await {
-                Some(ServerMsg::Assignment { prompts, .. }) => break prompts.len(),
-                Some(_) => continue,
-                None => panic!("closed before assignment"),
-            }
+        let mut player = Connection::admit(&registry, join(&room, Role::Player, Some(name))).await;
+        let ServerMsg::Assignment { prompts, .. } = player.recv().await else {
+            panic!("expected assignment")
         };
-
-        fire(
-            &handle,
-            ClientMsg::SubmitResponses {
-                responses: vec!["resp".to_string(); prompt_count],
+        player
+            .send(ClientMsg::SubmitResponses {
+                responses: vec!["resp".to_string(); prompts.len()],
                 signoff: "and that's the way it is".into(),
-            },
-            Role::Player,
-            Some(name),
-        )
-        .await;
+            })
+            .await;
+        player.barrier().await;
     }
 
     // Start the game -> final responses persist.
-    fire(&handle, ClientMsg::StartGame, Role::Host, None).await;
-    barrier(&handle).await;
+    host.send(ClientMsg::StartGame).await;
+    // Ping/Pong crosses the same actor queue and remains the completion
+    // barrier for all preceding durable effects, including best-effort writes.
+    host.barrier().await;
 
-    let final_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM responses WHERE room_code = $1")
-        .bind(&code)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let final_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM responses WHERE room_code = $1")
+            .bind(&code)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(final_count, 2, "two finalized responses should persist");
 
     // Archive -> rows move to the archive, live responses cleared.
-    fire(&handle, ClientMsg::ArchiveRound, Role::Host, None).await;
-    barrier(&handle).await;
+    host.send(ClientMsg::ArchiveRound).await;
+    host.barrier().await;
 
     let archived_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM response_archive WHERE room_code = $1")

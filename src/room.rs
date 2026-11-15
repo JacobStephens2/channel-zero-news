@@ -35,12 +35,30 @@ const BROADCAST_BUFFER: usize = 256;
 /// A validated intent handed to a room actor. `role`/`name` are established once
 /// at join time and held server-side by the connection task, so the client
 /// cannot forge them on later messages.
-pub struct Command {
+pub(crate) struct Command {
     pub intent: ClientMsg,
     pub role: Role,
     pub name: Option<String>,
     /// Channel for events meant only for the originating connection.
-    pub direct: DirectSender,
+    pub direct: DirectSender<Delivery>,
+}
+
+/// Runtime-only snapshot boundaries. Each envelope still occupies exactly one
+/// actual-message slot; neither metadata field is part of the wire protocol.
+pub(crate) struct Delivery {
+    pub message: ServerMsg,
+    pub snapshot_start: Option<broadcast::Receiver<ServerMsg>>,
+    pub snapshot_complete: bool,
+}
+
+impl Delivery {
+    pub(crate) fn ordinary(message: ServerMsg) -> Self {
+        Self {
+            message,
+            snapshot_start: None,
+            snapshot_complete: false,
+        }
+    }
 }
 
 /// A durable side effect for the actor to run against the database, produced by
@@ -78,10 +96,12 @@ impl Reaction {
 /// A cloneable handle to a running room actor.
 #[derive(Clone)]
 pub struct RoomHandle {
-    pub code: String,
-    pub host_token: String,
+    pub(crate) code: String,
     cmd_tx: mpsc::Sender<Command>,
+    #[cfg(test)]
     events_tx: broadcast::Sender<ServerMsg>,
+    #[cfg(test)]
+    pub(crate) actor: tokio::task::AbortHandle,
 }
 
 /// Returned when a room's actor task has stopped.
@@ -90,19 +110,24 @@ pub struct RoomClosed;
 
 impl RoomHandle {
     /// Subscribe to this room's broadcast event stream.
-    pub fn subscribe(&self) -> broadcast::Receiver<ServerMsg> {
+    #[cfg(test)]
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ServerMsg> {
         self.events_tx.subscribe()
     }
 
     /// Queue a command for the actor.
-    pub async fn dispatch(&self, cmd: Command) -> Result<(), RoomClosed> {
+    pub(crate) async fn dispatch(&self, cmd: Command) -> Result<(), RoomClosed> {
         self.cmd_tx.send(cmd).await.map_err(|_| RoomClosed)
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.cmd_tx.closed().await;
     }
 }
 
 /// Spawn a room actor and return a handle to it. `db` is `None` in tests and
 /// no-database runs, in which case durable effects are simply skipped.
-pub fn spawn_room(
+pub(crate) fn spawn_room(
     code: impl Into<String>,
     prompt_sets: Vec<PromptSet>,
     host_token: impl Into<String>,
@@ -114,13 +139,15 @@ pub fn spawn_room(
     let (events_tx, _events_rx) = broadcast::channel(BROADCAST_BUFFER);
 
     let state = GameState::new(code.clone(), prompt_sets);
-    tokio::spawn(run(state, host_token.clone(), cmd_rx, events_tx.clone(), db));
+    let _task = tokio::spawn(run(state, host_token, cmd_rx, events_tx.clone(), db));
 
     RoomHandle {
         code,
-        host_token,
         cmd_tx,
+        #[cfg(test)]
         events_tx,
+        #[cfg(test)]
+        actor: _task.abort_handle(),
     }
 }
 
@@ -144,10 +171,22 @@ async fn run(
             // Errs only when there are zero subscribers — fine to ignore.
             let _ = events_tx.send(msg);
         }
-        for msg in reaction.direct {
+        // The cut follows self-registration broadcasts and precedes every later
+        // command. Queue the complete prefix synchronously at that same cut.
+        let snapshot = matches!(
+            reaction.direct.first(),
+            Some(ServerMsg::Joined { .. })
+        );
+        let mut subscription = snapshot.then(|| events_tx.subscribe());
+        let reply_count = reaction.direct.len();
+        for (index, msg) in reaction.direct.into_iter().enumerate() {
             // Never waits, so one connection's full channel cannot hold up
             // the room; the overflow closes that connection instead.
-            cmd.direct.send(msg);
+            cmd.direct.send(Delivery {
+                message: msg,
+                snapshot_start: subscription.take(),
+                snapshot_complete: snapshot && index + 1 == reply_count,
+            });
         }
         for effect in reaction.effects {
             run_effect(&db, &state.code, effect).await;
@@ -492,9 +531,7 @@ fn transition_error(e: TransitionError) -> ServerMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::direct;
-    use crate::state::{Phase, PromptSet, TransitionError};
-    use std::time::Duration;
+    use crate::state::{PromptSet, TransitionError};
 
     fn sets() -> Vec<PromptSet> {
         vec![PromptSet {
@@ -507,25 +544,6 @@ mod tests {
 
     fn host_join() -> (GameState, String) {
         (GameState::new("ABCD", sets()), "secret-token".to_string())
-    }
-
-    /// Dispatch `intent` from a connection whose direct replies go to `direct`.
-    async fn dispatch_from(
-        handle: &RoomHandle,
-        direct: &DirectSender,
-        role: Role,
-        name: Option<&str>,
-        intent: ClientMsg,
-    ) {
-        handle
-            .dispatch(Command {
-                intent,
-                role,
-                name: name.map(String::from),
-                direct: direct.clone(),
-            })
-            .await
-            .unwrap();
     }
 
     #[test]
@@ -940,129 +958,5 @@ mod tests {
         assert!(forbidden(&r));
         let r = apply(&mut state, &token, Role::Player, Some("Bo"), ClientMsg::AdvanceSlide);
         assert!(!r.broadcasts.is_empty());
-    }
-
-    #[tokio::test]
-    async fn two_subscribers_receive_the_same_broadcast() {
-        let handle = spawn_room("ABCD", sets(), "tok", None);
-        let mut a = handle.subscribe();
-        let mut b = handle.subscribe();
-
-        let (tx, _rx) = direct::channel();
-        let intent = ClientMsg::AddPlayer { name: "Ann".into() };
-        dispatch_from(&handle, &tx, Role::Host, None, intent).await;
-
-        let ma = a.recv().await.unwrap();
-        let mb = b.recv().await.unwrap();
-        assert_eq!(ma, mb);
-        match ma {
-            ServerMsg::RoomState { room } => {
-                assert_eq!(room.players.len(), 1);
-                assert_eq!(room.phase, Phase::Lobby);
-            }
-            other => panic!("expected RoomState, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn forbidden_action_replies_direct_not_broadcast() {
-        let handle = spawn_room("ABCD", sets(), "tok", None);
-        let mut bcast = handle.subscribe();
-        let (tx, mut rx) = direct::channel();
-        let intent = ClientMsg::StartGame;
-        dispatch_from(&handle, &tx, Role::Player, Some("Ann"), intent).await;
-
-        // The originating connection gets a direct Forbidden error...
-        let err = rx.recv().await.unwrap();
-        assert!(matches!(
-            err,
-            ServerMsg::Error {
-                code: ErrorCode::Forbidden,
-                ..
-            }
-        ));
-        // ...and nothing is broadcast.
-        assert!(bcast.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn a_full_direct_reply_channel_does_not_stall_the_room() {
-        let handle = spawn_room("ABCD", sets(), "tok", None);
-        let mut events = handle.subscribe();
-
-        // Never read: one more ping than the channel holds overflows it.
-        let (stalled, _stalled_rx) = direct::channel();
-        for _ in 0..=direct::DIRECT_REPLY_CAPACITY {
-            dispatch_from(&handle, &stalled, Role::Display, None, ClientMsg::Ping).await;
-        }
-
-        let (other, mut other_rx) = direct::channel();
-        dispatch_from(&handle, &other, Role::Display, None, ClientMsg::Ping).await;
-        dispatch_from(
-            &handle,
-            &other,
-            Role::Host,
-            None,
-            ClientMsg::AddPlayer { name: "Ann".into() },
-        )
-        .await;
-        let served = async {
-            assert_eq!(other_rx.recv().await, Some(ServerMsg::Pong));
-            assert!(matches!(
-                events.recv().await,
-                Ok(ServerMsg::RoomState { room }) if room.players.len() == 1
-            ));
-        };
-        tokio::time::timeout(Duration::from_secs(2), served)
-            .await
-            .expect("the room stopped serving other connections");
-    }
-
-    #[tokio::test]
-    async fn a_player_rejoining_mid_performance_gets_every_direct_reply() {
-        let handle = spawn_room("ABCD", sets(), "tok", None);
-        let (setup, _setup_rx) = direct::channel();
-        let open_round = [
-            ClientMsg::AddPlayer { name: "Ann".into() },
-            ClientMsg::AddPlayer { name: "Bo".into() },
-            ClientMsg::StartCollecting,
-        ];
-        for intent in open_round {
-            dispatch_from(&handle, &setup, Role::Host, None, intent).await;
-        }
-        for name in ["Ann", "Bo"] {
-            let intent = ClientMsg::SubmitResponses {
-                responses: vec!["x".into(); 2],
-                signoff: "s".into(),
-            };
-            dispatch_from(&handle, &setup, Role::Player, Some(name), intent).await;
-        }
-        dispatch_from(&handle, &setup, Role::Host, None, ClientMsg::StartGame).await;
-
-        let (player, mut player_rx) = direct::channel();
-        let rejoin = ClientMsg::JoinRoom {
-            code: "ABCD".into(),
-            role: Role::Player,
-            name: Some("Ann".into()),
-            token: None,
-        };
-        dispatch_from(&handle, &player, Role::Player, Some("Ann"), rejoin).await;
-        drop(player);
-        let mut replies = Vec::new();
-        while let Some(reply) = player_rx.recv().await {
-            replies.push(reply);
-        }
-        assert!(
-            matches!(
-                replies.as_slice(),
-                [
-                    ServerMsg::Joined { .. },
-                    ServerMsg::RoomState { room },
-                    ServerMsg::SubmissionProgress { submitted: 2, total: 2, .. },
-                    ServerMsg::SlideChanged { index: 0, .. },
-                ] if room.phase == Phase::Performing
-            ),
-            "{replies:?}"
-        );
     }
 }
