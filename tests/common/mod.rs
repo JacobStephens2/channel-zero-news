@@ -48,9 +48,17 @@ pub async fn connect(addr: &str) -> Ws {
     ws
 }
 
+/// An HTTP client whose requests fail after two seconds instead of hanging.
+pub fn http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("client")
+}
+
 /// Create a room over REST, returning its join code and host token.
 pub async fn create_room(addr: &str) -> (String, String) {
-    let created: serde_json::Value = reqwest::Client::new()
+    let created: serde_json::Value = http()
         .post(format!("http://{addr}/api/rooms"))
         .send()
         .await

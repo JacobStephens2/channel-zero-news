@@ -27,6 +27,8 @@
 //! disconnecting mid-submission cannot corrupt the room — they can reconnect
 //! with the same name and submit again.
 
+use std::time::Duration;
+
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
@@ -40,6 +42,22 @@ use crate::direct;
 use crate::protocol::{ClientMsg, ErrorCode, Role, ServerMsg};
 use crate::registry::LiveSocket;
 use crate::room::{Command, RoomHandle};
+
+/// How long a connection whose room was removed waits for its outbound pump
+/// to write `unknown_room` before closing the socket anyway. A client that
+/// reads gets the error well within this; one that stopped reading leaves the
+/// pump stuck on an earlier write, and is closed without it.
+const REMOVAL_WRITE_GRACE: Duration = Duration::from_secs(1);
+
+/// Why a joined connection stopped reading its socket.
+enum Ended {
+    /// A direct reply overflowed the connection's channel.
+    Overflowed,
+    /// The registry removed the room, so its actor stopped.
+    RoomRemoved,
+    /// The client closed the socket, or it failed.
+    ClientLeft,
+}
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -139,7 +157,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // ---- 3. outbound pump: broadcast + direct -> socket ------------------
     let room = handle.clone();
     let removal_error = unknown_room(&code);
-    let outbound = tokio::spawn(async move {
+    let mut outbound = tokio::spawn(async move {
         let room_closed = room.closed();
         tokio::pin!(room_closed);
         loop {
@@ -204,28 +222,43 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     };
     // ---- 5. read until the client leaves, a direct reply overflows, or the
     // room is removed --------------------------------------------------------
-    let overflow = tokio::select! {
+    let ended = tokio::select! {
         // When several are ready the overflow wins, so the pump is aborted
         // rather than drained into a client that stopped reading.
         biased;
-        () = overflowed => true,
-        // The pump writes the room's removal as its last frame and stops.
-        () = handle.closed() => false,
-        () = inbound => false,
+        () = overflowed => Ended::Overflowed,
+        () = handle.closed() => Ended::RoomRemoved,
+        () = inbound => Ended::ClientLeft,
     };
 
-    if overflow {
-        // A reply was dropped, so close now. The pump may be stuck writing to
-        // a client that stopped reading: aborting it drops the sink, and
-        // returning drops the stream, which closes the socket.
-        outbound.abort();
-        tracing::warn!(%code, ?role, "direct reply channel overflowed; closing connection");
-    } else {
-        // Inbound ended, or the room was removed and the pump is writing its
-        // last frame: dropping direct_tx closes the outbound pump.
-        drop(direct_tx);
+    match ended {
+        Ended::Overflowed => {
+            // A reply was dropped, so close now. The pump may be stuck writing
+            // to a client that stopped reading: aborting it drops the sink,
+            // and returning drops the stream, which closes the socket.
+            outbound.abort();
+            tracing::warn!(%code, ?role, "direct reply channel overflowed; closing connection");
+            let _ = outbound.await;
+        }
+        Ended::RoomRemoved => {
+            // The pump writes `unknown_room` as its last frame and stops. One
+            // stuck writing to a client that stopped reading is aborted, as
+            // on overflow, so the socket still closes.
+            if tokio::time::timeout(REMOVAL_WRITE_GRACE, &mut outbound)
+                .await
+                .is_err()
+            {
+                outbound.abort();
+                tracing::warn!(%code, ?role, "room removed while its client stopped reading; closing connection");
+                let _ = outbound.await;
+            }
+        }
+        Ended::ClientLeft => {
+            // Dropping direct_tx closes the outbound pump.
+            drop(direct_tx);
+            let _ = outbound.await;
+        }
     }
-    let _ = outbound.await;
     tracing::debug!(%code, ?role, "connection closed");
 }
 
