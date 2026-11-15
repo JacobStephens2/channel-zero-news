@@ -1,12 +1,19 @@
-//! Live-room retention: a cap, and removal when no socket is attached.
+//! Live-room retention: a cap, a quota per client address, and removal when no
+//! socket is attached.
 //!
 //! The no-socket case is the security reproduction for anonymous
 //! `POST /api/rooms`: three empty creates, no WebSocket, one second later the
 //! registry count is 0. The HTTP body does not carry the count.
+//!
+//! The quota test serves the router as the binary does, with peer addresses,
+//! and sends what the local Apache forwards. The others serve it without peer
+//! addresses, so all their creates share one quota.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
-use channel_zero::app::{build_router, AppState};
+use channel_zero::app::{self, build_router, AppState};
+use channel_zero::client_address::ClientAddress;
 use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
 use channel_zero::registry::MAX_LIVE_ROOMS;
 use channel_zero::state::PromptSet;
@@ -32,15 +39,26 @@ struct Running {
     state: AppState,
 }
 
-async fn spawn_server() -> Running {
+enum Peers {
+    /// Plain `axum::serve`: requests carry no peer address.
+    Unknown,
+    /// [`app::serve`], as the binary serves.
+    Known,
+}
+
+async fn spawn_server(peers: Peers) -> Running {
     let state = AppState::in_memory(prompt_sets());
-    let app = build_router(state.clone(), "static");
+    let router = build_router(state.clone(), "static");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve");
+        match peers {
+            Peers::Unknown => axum::serve(listener, router).await,
+            Peers::Known => app::serve(listener, router).await,
+        }
+        .expect("serve");
     });
 
     let http = http();
@@ -72,7 +90,7 @@ fn http() -> reqwest::Client {
 
 #[tokio::test]
 async fn three_empty_posts_are_reaped_without_a_websocket() {
-    let running = spawn_server().await;
+    let running = spawn_server(Peers::Unknown).await;
     let http = http();
 
     for n in 1..=3 {
@@ -109,7 +127,7 @@ async fn three_empty_posts_are_reaped_without_a_websocket() {
 
 #[tokio::test]
 async fn a_joined_socket_keeps_the_room_and_closing_it_lets_the_deadline_remove_it() {
-    let running = spawn_server().await;
+    let running = spawn_server(Peers::Unknown).await;
     let http = http();
     let created: serde_json::Value = http
         .post(format!("http://{}/api/rooms", running.addr))
@@ -169,13 +187,15 @@ async fn a_joined_socket_keeps_the_room_and_closing_it_lets_the_deadline_remove_
 
 #[tokio::test]
 async fn create_past_the_cap_returns_unavailable_and_retains_nothing() {
-    let running = spawn_server().await;
+    let running = spawn_server(Peers::Unknown).await;
     let mut sockets = Vec::new();
-    for _ in 0..MAX_LIVE_ROOMS {
+    for n in 0..MAX_LIVE_ROOMS {
+        // One room per address, so no address reaches its own quota.
+        let creator = ClientAddress::from(IpAddr::from([10, 0, 0, u8::try_from(n).unwrap()]));
         let room = running
             .state
             .registry
-            .create_room(prompt_sets(), None)
+            .create_room(creator, prompt_sets(), None)
             .await
             .expect("room under the cap");
         sockets.push(
@@ -204,5 +224,75 @@ async fn create_past_the_cap_returns_unavailable_and_retains_nothing() {
         "rejected create still returned a code: {body}"
     );
     assert_eq!(running.state.registry.count().await, MAX_LIVE_ROOMS);
+    drop(sockets);
+}
+
+#[tokio::test]
+async fn one_forwarded_address_creates_eight_rooms_then_gets_429_while_another_still_creates() {
+    let running = spawn_server(Peers::Known).await;
+    let http = http();
+    let url = format!("http://{}/api/rooms", running.addr);
+    let mut sockets = Vec::new();
+    for n in 1..=8 {
+        // The client's own leading entry changes; the one Apache appends does not.
+        let response = http
+            .post(&url)
+            .header("x-forwarded-for", format!("198.51.100.{n}, 203.0.113.7"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("create {n} failed: {e}"));
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("create body");
+        assert!(
+            status.is_success(),
+            "create {n} status {status} body {body}"
+        );
+        let code = body["code"].as_str().expect("created code");
+        sockets.push(
+            running
+                .state
+                .registry
+                .open_socket(code)
+                .await
+                .expect("live room"),
+        );
+    }
+
+    let response = http
+        .post(&url)
+        .header("x-forwarded-for", "198.51.100.9, 203.0.113.7")
+        .send()
+        .await
+        .expect("9th create");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("error body");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "body {body}"
+    );
+    assert_eq!(body["error"], "too_many_rooms");
+    assert!(
+        body.get("code").is_none(),
+        "rejected create returned a code: {body}"
+    );
+    assert_eq!(running.state.registry.count().await, 8);
+
+    let response = http
+        .post(&url)
+        .header("x-forwarded-for", "203.0.113.8")
+        .send()
+        .await
+        .expect("create from another address");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("create body");
+    assert!(
+        status.is_success(),
+        "other address status {status} body {body}"
+    );
+    assert!(
+        body.get("code").is_some(),
+        "other address missing code: {body}"
+    );
     drop(sockets);
 }

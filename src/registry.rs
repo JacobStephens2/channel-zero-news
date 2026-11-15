@@ -6,8 +6,10 @@
 //! rare create/remove. Per-room state itself is *not* locked here: it is owned
 //! by the room's actor task.
 //!
-//! Creation retains at most [`MAX_LIVE_ROOMS`] rooms and draws at most
-//! [`MAX_JOIN_CODE_ATTEMPTS`] join codes. Past either limit it retains nothing.
+//! Creation retains at most [`MAX_LIVE_ROOMS`] rooms, at most
+//! [`MAX_ROOMS_PER_CLIENT`] of them created by one [`ClientAddress`], and draws
+//! at most [`MAX_JOIN_CODE_ATTEMPTS`] join codes. Past any limit it retains
+//! nothing.
 //! A room with no socket for [`IDLE_WITHOUT_SOCKET`] is dropped through the
 //! same map removal as [`Registry::remove`], which ends its actor once nothing
 //! else holds the handle.
@@ -18,6 +20,7 @@ use std::time::Duration;
 
 use rand::Rng;
 
+use crate::client_address::ClientAddress;
 use crate::db::Db;
 use crate::room::{spawn_room, RoomHandle};
 use crate::state::PromptSet;
@@ -33,6 +36,11 @@ const CODE_LEN: usize = 4;
 /// this process is for. Rooms with no socket are removed after
 /// [`IDLE_WITHOUT_SOCKET`], so the cap bounds rooms that actually have clients.
 pub const MAX_LIVE_ROOMS: usize = 128;
+
+/// Live rooms one [`ClientAddress`] may have created. Its next creation returns
+/// [`CreateRoomError::TooManyRooms`] and leaves the map unchanged; it can create
+/// again once one of its rooms is removed.
+pub const MAX_ROOMS_PER_CLIENT: usize = 8;
 
 /// Join-code draws taken while holding the rooms lock. If none is free,
 /// creation returns [`CreateRoomError::NoJoinCode`] and retains nothing.
@@ -58,6 +66,7 @@ pub struct Registry {
 
 struct RetainedRoom {
     handle: RoomHandle,
+    creator: ClientAddress,
     sockets: usize,
     idle_generation: u64,
 }
@@ -76,6 +85,9 @@ pub enum CreateRoomError {
     /// [`MAX_LIVE_ROOMS`] rooms are already retained.
     #[error("too many live rooms")]
     AtCapacity,
+    /// The creating address already has [`MAX_ROOMS_PER_CLIENT`] live rooms.
+    #[error("too many live rooms from this address")]
+    TooManyRooms,
     /// No free join code turned up within [`MAX_JOIN_CODE_ATTEMPTS`].
     #[error("could not allocate a join code")]
     NoJoinCode,
@@ -101,24 +113,30 @@ impl Registry {
         Arc::new(Self::default())
     }
 
-    /// Create a room with the given prompt-set catalog and start its actor.
-    /// Generates a unique join code and a secret host token. `db` is handed to
-    /// the room actor for durable effects (`None` to disable persistence).
+    /// Create a room for `creator` with the given prompt-set catalog and start
+    /// its actor. Generates a unique join code and a secret host token. `db` is
+    /// handed to the room actor for durable effects (`None` to disable
+    /// persistence).
     ///
-    /// Retains nothing when the live-room cap is already met or when no free
-    /// join code is drawn within [`MAX_JOIN_CODE_ATTEMPTS`]. The new room
-    /// starts with no socket, so [`IDLE_WITHOUT_SOCKET`] removes it unless a
-    /// socket attaches first.
+    /// Retains nothing when the live-room cap is already met, when `creator`
+    /// already has [`MAX_ROOMS_PER_CLIENT`] live rooms, or when no free join
+    /// code is drawn within [`MAX_JOIN_CODE_ATTEMPTS`]. The cap is checked
+    /// first, so a full registry returns [`CreateRoomError::AtCapacity`] to
+    /// every address. The new room starts with no socket, so
+    /// [`IDLE_WITHOUT_SOCKET`] removes it unless a socket attaches first.
     pub async fn create_room(
         self: &Arc<Self>,
+        creator: ClientAddress,
         prompt_sets: Vec<PromptSet>,
         db: Option<Db>,
     ) -> Result<NewRoom, CreateRoomError> {
-        self.create_room_drawing(prompt_sets, db, random_code).await
+        self.create_room_drawing(creator, prompt_sets, db, random_code)
+            .await
     }
 
     async fn create_room_drawing(
         self: &Arc<Self>,
+        creator: ClientAddress,
         prompt_sets: Vec<PromptSet>,
         db: Option<Db>,
         mut draw: impl FnMut() -> String,
@@ -128,6 +146,10 @@ impl Registry {
             if rooms.len() >= MAX_LIVE_ROOMS {
                 return Err(CreateRoomError::AtCapacity);
             }
+            let created = rooms.values().filter(|room| room.creator == creator);
+            if created.count() >= MAX_ROOMS_PER_CLIENT {
+                return Err(CreateRoomError::TooManyRooms);
+            }
             let code = allocate_code(&rooms, MAX_JOIN_CODE_ATTEMPTS, &mut draw)
                 .ok_or(CreateRoomError::NoJoinCode)?;
             let host_token = random_token();
@@ -136,6 +158,7 @@ impl Registry {
                 code.clone(),
                 RetainedRoom {
                     handle,
+                    creator,
                     sockets: 0,
                     idle_generation: INITIAL_IDLE_GENERATION,
                 },
@@ -283,6 +306,12 @@ mod tests {
         }]
     }
 
+    /// A distinct client address for each `n` below 256.
+    fn address(n: usize) -> ClientAddress {
+        let last = u8::try_from(n).expect("test addresses stay in 203.0.113.0/24");
+        ClientAddress::from(std::net::IpAddr::from([203, 0, 113, last]))
+    }
+
     async fn until_removed(reg: &Registry, code: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -299,7 +328,7 @@ mod tests {
     #[tokio::test]
     async fn create_and_lookup() {
         let reg = Registry::new();
-        let room = reg.create_room(sets(), None).await.unwrap();
+        let room = reg.create_room(address(0), sets(), None).await.unwrap();
         assert_eq!(room.code.len(), CODE_LEN);
         assert!(reg.get(&room.code).await.is_some());
         assert!(reg.get("ZZZZ").await.is_none());
@@ -311,8 +340,8 @@ mod tests {
         let reg = Registry::new();
         let mut codes = std::collections::HashSet::new();
         let mut sockets = Vec::new();
-        for _ in 0..50 {
-            let room = reg.create_room(sets(), None).await.unwrap();
+        for n in 0..50 {
+            let room = reg.create_room(address(n), sets(), None).await.unwrap();
             assert!(codes.insert(room.code.clone()), "duplicate code generated");
             sockets.push(reg.open_socket(&room.code).await.unwrap());
         }
@@ -324,29 +353,77 @@ mod tests {
         let reg = Registry::new();
         let mut sockets = Vec::new();
         let mut first = None;
-        for _ in 0..MAX_LIVE_ROOMS {
-            let room = reg.create_room(sets(), None).await.unwrap();
+        for n in 0..MAX_LIVE_ROOMS {
+            let room = reg.create_room(address(n), sets(), None).await.unwrap();
             first.get_or_insert_with(|| room.code.clone());
             sockets.push(reg.open_socket(&room.code).await.unwrap());
         }
-        let err = reg.create_room(sets(), None).await.unwrap_err();
+        let err = reg
+            .create_room(address(MAX_LIVE_ROOMS), sets(), None)
+            .await
+            .unwrap_err();
         assert_eq!(err, CreateRoomError::AtCapacity);
         assert_eq!(reg.count().await, MAX_LIVE_ROOMS);
         assert!(reg.get(first.as_deref().unwrap()).await.is_some());
     }
 
     #[tokio::test]
+    async fn an_address_holds_at_most_its_quota_of_live_rooms_and_others_still_create() {
+        let reg = Registry::new();
+        let mut sockets = Vec::new();
+        for _ in 0..MAX_ROOMS_PER_CLIENT {
+            let room = reg.create_room(address(7), sets(), None).await.unwrap();
+            sockets.push(reg.open_socket(&room.code).await.unwrap());
+        }
+        let err = reg.create_room(address(7), sets(), None).await.unwrap_err();
+        assert_eq!(err, CreateRoomError::TooManyRooms);
+        assert_eq!(reg.count().await, MAX_ROOMS_PER_CLIENT);
+        reg.create_room(address(8), sets(), None)
+            .await
+            .expect("another address is under its own quota");
+    }
+
+    #[tokio::test]
+    async fn an_address_at_its_quota_creates_again_once_one_of_its_rooms_is_removed() {
+        let reg = Registry::new();
+        let mut codes = Vec::new();
+        let mut sockets = Vec::new();
+        for _ in 0..MAX_ROOMS_PER_CLIENT {
+            let room = reg.create_room(address(7), sets(), None).await.unwrap();
+            sockets.push(reg.open_socket(&room.code).await.unwrap());
+            codes.push(room.code);
+        }
+        assert!(reg.remove(&codes[0]).await);
+        reg.create_room(address(7), sets(), None)
+            .await
+            .expect("removing a room frees one place in the address's quota");
+    }
+
+    #[tokio::test]
+    async fn at_the_live_room_cap_an_address_at_its_quota_still_gets_at_capacity() {
+        let reg = Registry::new();
+        let mut sockets = Vec::new();
+        for n in 0..MAX_LIVE_ROOMS {
+            let creator = address(n / MAX_ROOMS_PER_CLIENT);
+            let room = reg.create_room(creator, sets(), None).await.unwrap();
+            sockets.push(reg.open_socket(&room.code).await.unwrap());
+        }
+        let err = reg.create_room(address(0), sets(), None).await.unwrap_err();
+        assert_eq!(err, CreateRoomError::AtCapacity);
+    }
+
+    #[tokio::test]
     async fn join_code_attempts_are_bounded_and_a_miss_retains_nothing() {
         let reg = Registry::new();
         let created = reg
-            .create_room_drawing(sets(), None, || "ABCD".into())
+            .create_room_drawing(address(0), sets(), None, || "ABCD".into())
             .await
             .unwrap();
         assert_eq!(created.code, "ABCD");
 
         let mut draws = 0;
         let err = reg
-            .create_room_drawing(sets(), None, || {
+            .create_room_drawing(address(0), sets(), None, || {
                 draws += 1;
                 "ABCD".into()
             })
@@ -361,12 +438,12 @@ mod tests {
     #[tokio::test]
     async fn the_last_join_code_attempt_is_kept() {
         let reg = Registry::new();
-        reg.create_room_drawing(sets(), None, || "TAKEN".into())
+        reg.create_room_drawing(address(0), sets(), None, || "TAKEN".into())
             .await
             .unwrap();
         let mut draws = 0;
         let room = reg
-            .create_room_drawing(sets(), None, || {
+            .create_room_drawing(address(0), sets(), None, || {
                 draws += 1;
                 if draws < MAX_JOIN_CODE_ATTEMPTS {
                     "TAKEN".into()
@@ -384,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn remove_drops_the_registry_handle_so_the_actor_ends() {
         let reg = Registry::new();
-        let created = reg.create_room(sets(), None).await.unwrap();
+        let created = reg.create_room(address(0), sets(), None).await.unwrap();
         let handle = reg.get(&created.code).await.unwrap();
         let mut events = handle.subscribe();
         drop(handle);
@@ -395,7 +472,7 @@ mod tests {
     #[tokio::test]
     async fn a_room_with_no_socket_is_removed_and_its_actor_ends() {
         let reg = Registry::new();
-        let created = reg.create_room(sets(), None).await.unwrap();
+        let created = reg.create_room(address(0), sets(), None).await.unwrap();
         let handle = reg.get(&created.code).await.unwrap();
         let mut events = handle.subscribe();
         drop(handle);
@@ -407,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn an_open_socket_keeps_the_room_until_the_deadline_after_it_closes() {
         let reg = Registry::new();
-        let created = reg.create_room(sets(), None).await.unwrap();
+        let created = reg.create_room(address(0), sets(), None).await.unwrap();
         let code = created.code.clone();
         let (_handle, socket) = reg.open_socket(&code).await.unwrap();
         tokio::time::sleep(IDLE_WITHOUT_SOCKET + Duration::from_millis(300)).await;
@@ -429,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn the_room_stays_while_any_socket_is_open() {
         let reg = Registry::new();
-        let created = reg.create_room(sets(), None).await.unwrap();
+        let created = reg.create_room(address(0), sets(), None).await.unwrap();
         let code = created.code.clone();
         let (_first, first) = reg.open_socket(&code).await.unwrap();
         let (_second, second) = reg.open_socket(&code).await.unwrap();

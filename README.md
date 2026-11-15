@@ -26,19 +26,20 @@ host archives the round so the responses are retained but not reused.
 
 ```
 channel-zero/
-├── migrations/          SQLx migrations (prompt_sets, responses, response_archive)
+├── migrations/            SQLx migrations (prompt_sets, responses, response_archive)
 └── src/
-    ├── main.rs          binary: wire DB + router, serve
-    ├── app.rs           AppState + router construction
-    ├── routes.rs        REST: create/join room, prompt sets
-    ├── ws.rs            WebSocket upgrade + per-connection handler
-    ├── room.rs          per-room actor (owns state) + broadcast fan-out + pure reducer
-    ├── direct.rs        per-connection direct reply channel (fixed capacity)
-    ├── registry.rs      in-memory map of live rooms by join code
-    ├── state.rs         GameState machine (lobby→collecting→performing→archived)
-    ├── protocol.rs      serde message enums (client intents ↔ server events)
-    ├── db.rs            SQLx persistence
-    └── error.rs         typed error → HTTP/WS responses
+    ├── main.rs            binary: wire DB + router, serve
+    ├── app.rs             AppState + router construction + serving with peer addresses
+    ├── routes.rs          REST: create/join room, prompt sets
+    ├── client_address.rs  the client address a room create counts against
+    ├── ws.rs              WebSocket upgrade + per-connection handler
+    ├── room.rs            per-room actor (owns state) + broadcast fan-out + pure reducer
+    ├── direct.rs          per-connection direct reply channel (fixed capacity)
+    ├── registry.rs        in-memory map of live rooms by join code
+    ├── state.rs           GameState machine (lobby→collecting→performing→archived)
+    ├── protocol.rs        serde message enums (client intents ↔ server events)
+    ├── db.rs              SQLx persistence
+    └── error.rs           typed error → HTTP/WS responses
 ```
 
 ### Concurrency model (the centerpiece)
@@ -86,14 +87,20 @@ breaks the in-memory game.
 
 ## REST surface
 
-| Method | Path                 | Purpose                                   |
-|--------|----------------------|-------------------------------------------|
-| GET    | `/health`            | liveness                                  |
-| POST   | `/api/rooms`         | create a room → `{ code, host_token }`    |
-| GET    | `/api/rooms/:code`   | join validation → `{ exists }`            |
-| GET    | `/api/prompt-sets`   | the prompt-set catalog                    |
-| GET    | `/ws`                | the realtime game socket                  |
-| `/`    | (static)             | the test client                           |
+| Method | Path                 | Purpose                                                                                               |
+|--------|----------------------|-------------------------------------------------------------------------------------------------------|
+| GET    | `/health`            | liveness                                                                                              |
+| POST   | `/api/rooms`         | create a room → `{ code, host_token }`; 429 `too_many_rooms` when the client address has 8 live rooms |
+| GET    | `/api/rooms/:code`   | join validation → `{ exists }`                                                                        |
+| GET    | `/api/prompt-sets`   | the prompt-set catalog                                                                                |
+| GET    | `/ws`                | the realtime game socket                                                                              |
+| `/`    | (static)             | the test client                                                                                       |
+
+The client address is the rightmost `X-Forwarded-For` entry when the request
+comes from loopback (the local Apache appends it) and the TCP peer otherwise,
+with IPv6 counted by its /64. The address can create again once one of its
+rooms is removed. The 128-room cap across all addresses still answers 503
+`unavailable`.
 
 ## Protocol
 
