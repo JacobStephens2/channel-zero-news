@@ -369,7 +369,6 @@ fn random_token() -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::sync::broadcast;
 
     fn sets() -> Vec<PromptSet> {
         vec![PromptSet {
@@ -487,26 +486,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_drops_the_registry_handle_so_the_actor_ends() {
+    async fn remove_stops_the_actor_while_a_handle_is_held() {
         let reg = Registry::new();
         let created = reg.create_room(sets(), None).await.unwrap();
         let handle = reg.get(&created.code).await.unwrap();
-        let mut events = handle.subscribe();
-        drop(handle);
         assert!(reg.remove(&created.code).await);
-        assert_actor_ended(&mut events).await;
+        assert_actor_stopped(&handle).await;
     }
 
     #[tokio::test]
-    async fn a_room_with_no_socket_is_removed_and_its_actor_ends() {
+    async fn a_room_with_no_socket_is_removed_and_its_actor_stops() {
         let reg = Registry::new();
         let created = reg.create_room(sets(), None).await.unwrap();
         let handle = reg.get(&created.code).await.unwrap();
-        let mut events = handle.subscribe();
-        drop(handle);
         until_removed(&reg, &created.code).await;
         assert_eq!(reg.count().await, 0);
-        assert_actor_ended(&mut events).await;
+        assert_actor_stopped(&handle).await;
     }
 
     #[tokio::test]
@@ -596,19 +591,5 @@ mod tests {
             handle.dispatch(ping).await.is_err(),
             "a stopped room actor accepted a command"
         );
-    }
-
-    async fn assert_actor_ended(events: &mut broadcast::Receiver<crate::protocol::ServerMsg>) {
-        tokio::select! {
-            ended = events.recv() => {
-                assert!(
-                    matches!(ended, Err(broadcast::error::RecvError::Closed)),
-                    "actor dropped its broadcast sender, got {ended:?}"
-                );
-            }
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                panic!("room actor was still running after registry removal");
-            }
-        }
     }
 }

@@ -540,6 +540,11 @@ mod tests {
         (GameState::new("ABCD", sets()), "secret-token".to_string())
     }
 
+    /// A running room actor with no database that nothing stops.
+    fn spawn_test_room() -> RoomHandle {
+        spawn_room("ABCD", sets(), "tok", None, std::future::pending())
+    }
+
     /// Dispatch `intent` from a connection whose direct replies go to `direct`.
     async fn dispatch_from(
         handle: &RoomHandle,
@@ -975,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_subscribers_receive_the_same_broadcast() {
-        let handle = spawn_room("ABCD", sets(), "tok", None, std::future::pending());
+        let handle = spawn_test_room();
         let mut a = handle.subscribe();
         let mut b = handle.subscribe();
 
@@ -997,7 +1002,7 @@ mod tests {
 
     #[tokio::test]
     async fn forbidden_action_replies_direct_not_broadcast() {
-        let handle = spawn_room("ABCD", sets(), "tok", None, std::future::pending());
+        let handle = spawn_test_room();
         let mut bcast = handle.subscribe();
         let (tx, mut rx) = direct::channel();
         let intent = ClientMsg::StartGame;
@@ -1018,7 +1023,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_full_direct_reply_channel_does_not_stall_the_room() {
-        let handle = spawn_room("ABCD", sets(), "tok", None, std::future::pending());
+        let handle = spawn_test_room();
         let mut events = handle.subscribe();
 
         // Never read: one more ping than the channel holds overflows it.
@@ -1051,7 +1056,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_player_rejoining_mid_performance_gets_every_direct_reply() {
-        let handle = spawn_room("ABCD", sets(), "tok", None, std::future::pending());
+        let handle = spawn_test_room();
         let (setup, _setup_rx) = direct::channel();
         let open_round = [
             ClientMsg::AddPlayer { name: "Ann".into() },
