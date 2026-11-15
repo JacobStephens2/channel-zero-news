@@ -74,6 +74,11 @@ pub const IDLE_WITHOUT_SOCKET: Duration = Duration::from_millis(500);
 /// activity. Room activity is an intent the room accepts and broadcasts as a
 /// state change, so sockets that only ping or join without adding a player
 /// do not keep a room.
+///
+/// Issue #15 sets 2 hours. A round in play changes state with each roster
+/// change, submission and slide move; a room no one plays in holds one of the
+/// [`MAX_LIVE_ROOMS`] slots for at most 2 hours after its last change,
+/// however many sockets stay attached.
 pub const IDLE_WITHOUT_ACTIVITY: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Default)]
@@ -115,18 +120,16 @@ struct RoomInstance {
     serial: u64,
 }
 
-/// What a deadline checks when it wakes.
+/// What an armed sleep checks when it wakes, [`IDLE_WITHOUT_SOCKET`] after
+/// it was armed.
 #[derive(Clone, Copy)]
 enum Deadline {
-    /// Wakes [`IDLE_WITHOUT_SOCKET`] after creation: removes the room unless
-    /// its host join was acknowledged, even with sockets attached.
+    /// Armed at creation: removes the room unless its host join was
+    /// acknowledged, even with sockets attached.
     Creation,
-    /// Wakes [`IDLE_WITHOUT_SOCKET`] after the last socket closed: removes
-    /// the room unless a socket has opened since.
+    /// Armed when the last socket closed: removes the room unless a socket
+    /// has opened since.
     Idle(u64),
-    /// Wakes once the room has gone [`IDLE_WITHOUT_ACTIVITY`] without room
-    /// activity: removes it, even with sockets attached.
-    Activity,
 }
 
 /// What a freshly created room hands back to the host: the public join code and
@@ -301,8 +304,6 @@ impl Registry {
         self.arm(room.clone(), Deadline::Idle(generation));
     }
 
-    /// Reap `room` for `deadline`, [`Deadline::Creation`] or
-    /// [`Deadline::Idle`], [`IDLE_WITHOUT_SOCKET`] from now.
     fn arm(self: &Arc<Self>, room: RoomInstance, deadline: Deadline) {
         let registry = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -314,10 +315,11 @@ impl Registry {
         });
     }
 
-    /// Reap `room` once `inactive` resolves, as [`RoomHandle::inactive_for`]
-    /// does after [`IDLE_WITHOUT_ACTIVITY`] without room activity. Ends
-    /// without reaping once the room's actor stops, as it does when the room
-    /// is removed any other way.
+    /// Remove `room` once `inactive` resolves, as [`RoomHandle::inactive_for`]
+    /// does after [`IDLE_WITHOUT_ACTIVITY`] without room activity, through
+    /// the same map removal as the other deadlines and only while `room` is
+    /// still retained. Ends without removing anything once the room's actor
+    /// stops, as it does when the room is removed any other way.
     fn arm_activity(
         self: &Arc<Self>,
         room: RoomInstance,
@@ -331,7 +333,7 @@ impl Registry {
             let Some(registry) = registry.upgrade() else {
                 return;
             };
-            registry.reap(&room, Deadline::Activity);
+            registry.remove_room(&room.code, |retained| retained.is(&room));
         });
     }
 
@@ -346,9 +348,6 @@ impl Registry {
                     Deadline::Idle(generation) => {
                         retained.sockets == 0 && retained.idle_generation == generation
                     }
-                    // Only `arm_activity` reaps for it, once the room has gone
-                    // `IDLE_WITHOUT_ACTIVITY` without activity.
-                    Deadline::Activity => true,
                 }
         });
     }
@@ -680,15 +679,17 @@ mod tests {
         let code = created.code.clone();
         let (handle, _socket) = open_host_socket(&reg, &code).await;
 
-        tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+        tokio::time::sleep(IDLE_WITHOUT_ACTIVITY / 2).await;
         let add_ann = ClientMsg::AddPlayer { name: "Ann".into() };
         assert_eq!(replies_to(&handle, Role::Host, None, add_ann).await, vec![]);
         let last_change = Instant::now();
 
-        // Every half hour, and a minute before the deadline: a ping, joins
+        // Every quarter of the deadline, and a minute before it: a ping, joins
         // that add no player and intents the room rejects.
-        for minutes in [30, 60, 90, 119] {
-            tokio::time::sleep_until(last_change + Duration::from_secs(minutes * 60)).await;
+        let quarter = IDLE_WITHOUT_ACTIVITY / 4;
+        let minute_before = IDLE_WITHOUT_ACTIVITY - Duration::from_secs(60);
+        for offset in [quarter, quarter * 2, quarter * 3, minute_before] {
+            tokio::time::sleep_until(last_change + offset).await;
             let pong = replies_to(&handle, Role::Display, None, ClientMsg::Ping).await;
             assert_eq!(pong, vec![ServerMsg::Pong]);
             for (role, name) in [(Role::Display, None), (Role::Player, Some("Ann"))] {
@@ -790,7 +791,7 @@ mod tests {
             .await
             .unwrap();
         let removed = open_host_socket(&reg, "ABCD").await;
-        tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+        tokio::time::sleep(IDLE_WITHOUT_ACTIVITY / 2).await;
         assert!(reg.remove("ABCD").await);
         drop(removed);
 
@@ -801,7 +802,7 @@ mod tests {
         let (_handle, _socket) = open_host_socket(&reg, "ABCD").await;
 
         // A second past the removed room's activity deadline.
-        tokio::time::sleep(Duration::from_secs(60 * 60 + 1)).await;
+        tokio::time::sleep(IDLE_WITHOUT_ACTIVITY / 2 + Duration::from_secs(1)).await;
         assert!(
             reg.get("ABCD").await.is_some(),
             "the removed room's activity deadline removed the new room"

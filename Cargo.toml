@@ -19,7 +19,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-# Paused time for deadlines too long to wait out, such as the registry's.
+# Paused time (start_paused), so tests can run through the 2-hour
+# IDLE_WITHOUT_ACTIVITY deadline without waiting.
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.24"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

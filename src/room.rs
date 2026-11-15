@@ -1150,4 +1150,20 @@ mod tests {
             "{replies:?}"
         );
     }
+
+    /// The registry waits on `inactive_for` once per room, so the wait must
+    /// end with the actor rather than outlive a room removed any other way.
+    #[tokio::test(start_paused = true)]
+    async fn inactive_for_resolves_with_room_closed_once_the_actor_stops() {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let handle = spawn_room("ABCD", sets(), "tok", None, async move {
+            let _ = stopped.await;
+        });
+        let inactive = handle.inactive_for(Duration::from_secs(2 * 60 * 60));
+        drop(stop);
+        let ended = tokio::time::timeout(Duration::from_secs(5), inactive)
+            .await
+            .expect("the wait outlived the room's actor");
+        assert!(matches!(ended, Err(RoomClosed)));
+    }
 }
