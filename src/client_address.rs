@@ -8,8 +8,11 @@
 //!   the client; entries left of it came from the client itself. With no
 //!   header, or a rightmost entry that is not an IP address, the peer is used.
 //! * Any other peer is the client: its own address, forwarded headers ignored.
-//! * With no known peer (the router served without peer addresses, as the
+//! * With no known peer (the router served without peer addresses, as most
 //!   integration tests serve it), every request shares [`ClientAddress::NO_PEER`].
+//!
+//! Trusting the rightmost entry depends on Apache appending it;
+//! `deploy/README.md` says what breaks if it stops.
 //!
 //! IPv4-mapped IPv6 is keyed as IPv4. Other IPv6 is keyed by its /64, because
 //! one host can draw fresh addresses from its /64 at will (temporary SLAAC
@@ -32,6 +35,15 @@ impl ClientAddress {
     /// The one key every request without a peer address shares.
     pub const NO_PEER: Self = Self(None);
 
+    /// The key for `ip`. IPv4-mapped IPv6 is keyed as IPv4, and other IPv6 by
+    /// its /64, so every address in one /64 shares a key.
+    pub fn key_for(ip: IpAddr) -> Self {
+        Self(Some(match ip.to_canonical() {
+            IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & SLASH_64_MASK)),
+            v4 => v4,
+        }))
+    }
+
     /// Resolve the client from the TCP `peer` (`None` when the router is
     /// served without peer addresses) and the request `headers`.
     pub fn resolve(peer: Option<IpAddr>, headers: &HeaderMap) -> Self {
@@ -40,20 +52,10 @@ impl ClientAddress {
         };
         if peer.is_loopback() {
             if let Some(forwarded) = rightmost_forwarded_for(headers) {
-                return Self::from(forwarded);
+                return Self::key_for(forwarded);
             }
         }
-        Self::from(peer)
-    }
-}
-
-/// Keys IPv4-mapped IPv6 as IPv4, and other IPv6 by its /64.
-impl From<IpAddr> for ClientAddress {
-    fn from(ip: IpAddr) -> Self {
-        Self(Some(match ip.to_canonical() {
-            IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & SLASH_64_MASK)),
-            v4 => v4,
-        }))
+        Self::key_for(peer)
     }
 }
 
@@ -111,8 +113,8 @@ mod tests {
     fn a_peer_other_than_loopback_is_keyed_by_its_own_address_and_its_forwarded_header_is_ignored()
     {
         let key = ClientAddress::resolve(Some(ip("198.51.100.20")), &forwarded_for("203.0.113.7"));
-        assert_eq!(key, ClientAddress::from(ip("198.51.100.20")));
-        assert_ne!(key, ClientAddress::from(ip("203.0.113.7")));
+        assert_eq!(key, ClientAddress::key_for(ip("198.51.100.20")));
+        assert_ne!(key, ClientAddress::key_for(ip("203.0.113.7")));
     }
 
     #[test]
@@ -122,7 +124,7 @@ mod tests {
         for headers in [forwarded_for("198.51.100.9, 203.0.113.7"), separate_lines] {
             assert_eq!(
                 ClientAddress::resolve(Some(ip("127.0.0.1")), &headers),
-                ClientAddress::from(ip("203.0.113.7")),
+                ClientAddress::key_for(ip("203.0.113.7")),
                 "{headers:?}"
             );
         }
@@ -147,7 +149,7 @@ mod tests {
         for headers in cases {
             assert_eq!(
                 ClientAddress::resolve(Some(local), &headers),
-                ClientAddress::from(local),
+                ClientAddress::key_for(local),
                 "{headers:?}"
             );
         }
@@ -168,7 +170,7 @@ mod tests {
 
     #[test]
     fn ipv4_mapped_addresses_are_keyed_as_ipv4() {
-        let client = ClientAddress::from(ip("203.0.113.7"));
+        let client = ClientAddress::key_for(ip("203.0.113.7"));
         let cases = [
             ("127.0.0.1", "::ffff:203.0.113.7"),
             ("::ffff:127.0.0.1", "203.0.113.7"),

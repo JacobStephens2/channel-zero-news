@@ -43,7 +43,7 @@ impl AppError {
 impl From<CreateRoomError> for AppError {
     fn from(err: CreateRoomError) -> Self {
         match err {
-            CreateRoomError::TooManyRooms => AppError::TooManyRooms(err.to_string()),
+            CreateRoomError::AtQuota => AppError::TooManyRooms(err.to_string()),
             CreateRoomError::AtCapacity | CreateRoomError::NoJoinCode => {
                 AppError::Unavailable(err.to_string())
             }

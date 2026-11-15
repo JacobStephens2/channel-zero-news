@@ -88,6 +88,26 @@ fn http() -> reqwest::Client {
         .expect("client")
 }
 
+/// `POST /api/rooms` carrying `forwarded_for` as its `X-Forwarded-For`.
+async fn create_from(
+    http: &reqwest::Client,
+    url: &str,
+    forwarded_for: &str,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let response = http
+        .post(url)
+        .header("x-forwarded-for", forwarded_for)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("create from {forwarded_for:?} failed: {e}"));
+    let status = response.status();
+    let body = response
+        .json()
+        .await
+        .unwrap_or_else(|e| panic!("create from {forwarded_for:?} body: {e}"));
+    (status, body)
+}
+
 #[tokio::test]
 async fn three_empty_posts_are_reaped_without_a_websocket() {
     let running = spawn_server(Peers::Unknown).await;
@@ -191,7 +211,7 @@ async fn create_past_the_cap_returns_unavailable_and_retains_nothing() {
     let mut sockets = Vec::new();
     for n in 0..MAX_LIVE_ROOMS {
         // One room per address, so no address reaches its own quota.
-        let creator = ClientAddress::from(IpAddr::from([10, 0, 0, u8::try_from(n).unwrap()]));
+        let creator = ClientAddress::key_for(IpAddr::from([10, 0, 0, u8::try_from(n).unwrap()]));
         let room = running
             .state
             .registry
@@ -235,14 +255,8 @@ async fn one_forwarded_address_creates_eight_rooms_then_gets_429_while_another_s
     let mut sockets = Vec::new();
     for n in 1..=8 {
         // The client's own leading entry changes; the one Apache appends does not.
-        let response = http
-            .post(&url)
-            .header("x-forwarded-for", format!("198.51.100.{n}, 203.0.113.7"))
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("create {n} failed: {e}"));
-        let status = response.status();
-        let body: serde_json::Value = response.json().await.expect("create body");
+        let forwarded_for = format!("198.51.100.{n}, 203.0.113.7");
+        let (status, body) = create_from(&http, &url, &forwarded_for).await;
         assert!(
             status.is_success(),
             "create {n} status {status} body {body}"
@@ -258,14 +272,7 @@ async fn one_forwarded_address_creates_eight_rooms_then_gets_429_while_another_s
         );
     }
 
-    let response = http
-        .post(&url)
-        .header("x-forwarded-for", "198.51.100.9, 203.0.113.7")
-        .send()
-        .await
-        .expect("9th create");
-    let status = response.status();
-    let body: serde_json::Value = response.json().await.expect("error body");
+    let (status, body) = create_from(&http, &url, "198.51.100.9, 203.0.113.7").await;
     assert_eq!(
         status,
         reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -278,14 +285,7 @@ async fn one_forwarded_address_creates_eight_rooms_then_gets_429_while_another_s
     );
     assert_eq!(running.state.registry.count().await, 8);
 
-    let response = http
-        .post(&url)
-        .header("x-forwarded-for", "203.0.113.8")
-        .send()
-        .await
-        .expect("create from another address");
-    let status = response.status();
-    let body: serde_json::Value = response.json().await.expect("create body");
+    let (status, body) = create_from(&http, &url, "203.0.113.8").await;
     assert!(
         status.is_success(),
         "other address status {status} body {body}"

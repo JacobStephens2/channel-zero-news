@@ -34,9 +34,12 @@ any entries the client sent in front of it.
 
 * Keep `CHANNEL_ZERO_ADDR` on `127.0.0.1` behind Apache. A request from any
   other peer counts against that peer's own address, forwarded headers ignored.
-* `ProxyAddHeaders Off`, or another proxy in front of Apache, would key every
-  create on 127.0.0.1 or on that proxy's address, so all clients would share
-  one 8-room quota.
+* Keep `ProxyAddHeaders` on. With it Off, Apache stops appending but still
+  forwards any `X-Forwarded-For` the client sent, so the rightmost entry is the
+  client's own choice: a client could name a new address on every create and
+  skip the quota. Clients that send no header would share 127.0.0.1's quota.
+* Another proxy in front of Apache would key every create on that proxy's
+  address, so all clients behind it would share one 8-room quota.
 
 ## Apply / update
 

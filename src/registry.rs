@@ -38,7 +38,7 @@ const CODE_LEN: usize = 4;
 pub const MAX_LIVE_ROOMS: usize = 128;
 
 /// Live rooms one [`ClientAddress`] may have created. Its next creation returns
-/// [`CreateRoomError::TooManyRooms`] and leaves the map unchanged; it can create
+/// [`CreateRoomError::AtQuota`] and leaves the map unchanged; it can create
 /// again once one of its rooms is removed.
 pub const MAX_ROOMS_PER_CLIENT: usize = 8;
 
@@ -87,7 +87,7 @@ pub enum CreateRoomError {
     AtCapacity,
     /// The creating address already has [`MAX_ROOMS_PER_CLIENT`] live rooms.
     #[error("too many live rooms from this address")]
-    TooManyRooms,
+    AtQuota,
     /// No free join code turned up within [`MAX_JOIN_CODE_ATTEMPTS`].
     #[error("could not allocate a join code")]
     NoJoinCode,
@@ -148,7 +148,7 @@ impl Registry {
             }
             let created = rooms.values().filter(|room| room.creator == creator);
             if created.count() >= MAX_ROOMS_PER_CLIENT {
-                return Err(CreateRoomError::TooManyRooms);
+                return Err(CreateRoomError::AtQuota);
             }
             let code = allocate_code(&rooms, MAX_JOIN_CODE_ATTEMPTS, &mut draw)
                 .ok_or(CreateRoomError::NoJoinCode)?;
@@ -309,7 +309,18 @@ mod tests {
     /// A distinct client address for each `n` below 256.
     fn address(n: usize) -> ClientAddress {
         let last = u8::try_from(n).expect("test addresses stay in 203.0.113.0/24");
-        ClientAddress::from(std::net::IpAddr::from([203, 0, 113, last]))
+        ClientAddress::key_for(std::net::IpAddr::from([203, 0, 113, last]))
+    }
+
+    /// Create a room for `creator` and hold a socket on it, so the idle
+    /// deadline keeps the room while the guard lives.
+    async fn create_with_socket(
+        reg: &Arc<Registry>,
+        creator: ClientAddress,
+    ) -> (String, LiveSocket) {
+        let room = reg.create_room(creator, sets(), None).await.unwrap();
+        let (_handle, socket) = reg.open_socket(&room.code).await.unwrap();
+        (room.code, socket)
     }
 
     async fn until_removed(reg: &Registry, code: &str) {
@@ -341,9 +352,9 @@ mod tests {
         let mut codes = std::collections::HashSet::new();
         let mut sockets = Vec::new();
         for n in 0..50 {
-            let room = reg.create_room(address(n), sets(), None).await.unwrap();
-            assert!(codes.insert(room.code.clone()), "duplicate code generated");
-            sockets.push(reg.open_socket(&room.code).await.unwrap());
+            let (code, socket) = create_with_socket(&reg, address(n)).await;
+            assert!(codes.insert(code), "duplicate code generated");
+            sockets.push(socket);
         }
         assert_eq!(reg.count().await, 50);
     }
@@ -354,9 +365,9 @@ mod tests {
         let mut sockets = Vec::new();
         let mut first = None;
         for n in 0..MAX_LIVE_ROOMS {
-            let room = reg.create_room(address(n), sets(), None).await.unwrap();
-            first.get_or_insert_with(|| room.code.clone());
-            sockets.push(reg.open_socket(&room.code).await.unwrap());
+            let (code, socket) = create_with_socket(&reg, address(n)).await;
+            first.get_or_insert(code);
+            sockets.push(socket);
         }
         let err = reg
             .create_room(address(MAX_LIVE_ROOMS), sets(), None)
@@ -372,11 +383,11 @@ mod tests {
         let reg = Registry::new();
         let mut sockets = Vec::new();
         for _ in 0..MAX_ROOMS_PER_CLIENT {
-            let room = reg.create_room(address(7), sets(), None).await.unwrap();
-            sockets.push(reg.open_socket(&room.code).await.unwrap());
+            let (_code, socket) = create_with_socket(&reg, address(7)).await;
+            sockets.push(socket);
         }
         let err = reg.create_room(address(7), sets(), None).await.unwrap_err();
-        assert_eq!(err, CreateRoomError::TooManyRooms);
+        assert_eq!(err, CreateRoomError::AtQuota);
         assert_eq!(reg.count().await, MAX_ROOMS_PER_CLIENT);
         reg.create_room(address(8), sets(), None)
             .await
@@ -389,9 +400,9 @@ mod tests {
         let mut codes = Vec::new();
         let mut sockets = Vec::new();
         for _ in 0..MAX_ROOMS_PER_CLIENT {
-            let room = reg.create_room(address(7), sets(), None).await.unwrap();
-            sockets.push(reg.open_socket(&room.code).await.unwrap());
-            codes.push(room.code);
+            let (code, socket) = create_with_socket(&reg, address(7)).await;
+            codes.push(code);
+            sockets.push(socket);
         }
         assert!(reg.remove(&codes[0]).await);
         reg.create_room(address(7), sets(), None)
@@ -405,8 +416,8 @@ mod tests {
         let mut sockets = Vec::new();
         for n in 0..MAX_LIVE_ROOMS {
             let creator = address(n / MAX_ROOMS_PER_CLIENT);
-            let room = reg.create_room(creator, sets(), None).await.unwrap();
-            sockets.push(reg.open_socket(&room.code).await.unwrap());
+            let (_code, socket) = create_with_socket(&reg, creator).await;
+            sockets.push(socket);
         }
         let err = reg.create_room(address(0), sets(), None).await.unwrap_err();
         assert_eq!(err, CreateRoomError::AtCapacity);
