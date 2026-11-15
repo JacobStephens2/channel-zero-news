@@ -8,15 +8,24 @@
 //!
 //! Creation retains at most [`MAX_LIVE_ROOMS`] rooms and draws at most
 //! [`MAX_JOIN_CODE_ATTEMPTS`] join codes. Past either limit it retains nothing.
-//! A room with no socket for [`IDLE_WITHOUT_SOCKET`] is dropped through the
-//! same map removal as [`Registry::remove`], which ends its actor once nothing
-//! else holds the handle.
+//!
+//! Until its host join is acknowledged ([`LiveSocket::host_joined`]), a room is
+//! removed at its creation deadline, [`IDLE_WITHOUT_SOCKET`] after creation,
+//! even with other sockets attached. After that any socket keeps it, and it is
+//! removed [`IDLE_WITHOUT_SOCKET`] after the last one closes. Both deadlines go
+//! through the same map removal as [`Registry::remove`], which stops the room's
+//! actor even while connections still hold its handle; each of them then sends
+//! its socket `unknown_room` and closes it. Retention is tracked per room
+//! instance, so a removed room's late socket closes and deadlines never touch a
+//! new room that reuses its join code.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rand::Rng;
+use tokio::sync::oneshot;
 
 use crate::db::Db;
 use crate::room::{spawn_room, RoomHandle};
@@ -30,36 +39,74 @@ const CODE_LEN: usize = 4;
 /// [`CreateRoomError::AtCapacity`] and leaves the map unchanged.
 ///
 /// 128 is far below the 31^4 join-code space and more concurrent parties than
-/// this process is for. Rooms with no socket are removed after
-/// [`IDLE_WITHOUT_SOCKET`], so the cap bounds rooms that actually have clients.
+/// this process is for. Rooms whose host never joins are removed at their
+/// creation deadline and rooms with no socket after [`IDLE_WITHOUT_SOCKET`], so
+/// the cap bounds hosted rooms that actually have clients.
 pub const MAX_LIVE_ROOMS: usize = 128;
 
 /// Join-code draws taken while holding the rooms lock. If none is free,
 /// creation returns [`CreateRoomError::NoJoinCode`] and retains nothing.
 pub const MAX_JOIN_CODE_ATTEMPTS: usize = 32;
 
-/// How long a room may have zero sockets before it is removed.
+/// How long a room may have zero sockets before it is removed. It is also the
+/// creation deadline: a room whose host join is not acknowledged this long
+/// after creation is removed, whatever sockets are attached.
 ///
 /// The retention proof waits one second after creates with no socket and
 /// requires the registry count to be 0. Half a second leaves schedule margin
-/// inside that window. The host client opens its socket immediately after
-/// `POST /api/rooms`.
+/// inside that window. The host client opens its socket and joins immediately
+/// after `POST /api/rooms`.
 pub const IDLE_WITHOUT_SOCKET: Duration = Duration::from_millis(500);
-
-/// First idle generation armed at insert. Later empty intervals bump it so an
-/// in-flight sleep cannot remove a room that has since gained a socket or
-/// started a newer empty interval.
-const INITIAL_IDLE_GENERATION: u64 = 1;
 
 #[derive(Default)]
 pub struct Registry {
     rooms: RwLock<HashMap<String, RetainedRoom>>,
+    /// Serial number for the next created room, see [`RoomInstance`].
+    next_serial: AtomicU64,
 }
 
 struct RetainedRoom {
     handle: RoomHandle,
+    /// Unique among the rooms this registry has created.
+    serial: u64,
     sockets: usize,
+    /// Set once the room acknowledges a host join. Until then the creation
+    /// deadline removes the room whatever sockets are attached.
+    host_joined: bool,
+    /// Bumped whenever the socket count leaves or reaches zero, so an
+    /// in-flight idle sleep cannot remove a room that has since gained a
+    /// socket or started a newer empty interval.
     idle_generation: u64,
+    /// Never sent: dropping it with this entry stops the room's actor.
+    _stop: oneshot::Sender<()>,
+}
+
+impl RetainedRoom {
+    /// Whether this entry is `room`, not a later room with its join code.
+    fn is(&self, room: &RoomInstance) -> bool {
+        self.serial == room.serial
+    }
+}
+
+/// One created room: its join code and serial number. Socket closes and
+/// deadlines carry the instance they belong to, so once a room is removed
+/// they never act on a new room that reuses its join code.
+#[derive(Clone)]
+struct RoomInstance {
+    code: String,
+    serial: u64,
+}
+
+/// What an armed sleep checks when it wakes, [`IDLE_WITHOUT_SOCKET`] after
+/// it was armed.
+#[derive(Clone, Copy)]
+enum Deadline {
+    /// Armed at creation: removes the room unless its host join was
+    /// acknowledged, even with sockets attached.
+    Creation,
+    /// Armed when the last socket closed: removes the room unless a socket
+    /// has opened since.
+    Idle(u64),
 }
 
 /// What a freshly created room hands back to the host: the public join code and
@@ -83,16 +130,26 @@ pub enum CreateRoomError {
 
 /// Held for as long as one WebSocket is attached to a room. Dropping it,
 /// including when the connection task ends, starts the idle deadline once no
-/// socket remains.
+/// socket remains. It belongs to one room instance: once that room is removed,
+/// dropping it changes nothing, even if a new room has taken the join code.
 #[must_use = "dropping this marks the socket closed"]
 pub struct LiveSocket {
     registry: Arc<Registry>,
-    code: String,
+    room: RoomInstance,
+}
+
+impl LiveSocket {
+    /// Record that the room acknowledged this socket's host join. From then
+    /// on any socket keeps the room, which until now its creation deadline
+    /// removes even with sockets attached.
+    pub fn host_joined(&self) {
+        self.registry.host_joined(&self.room);
+    }
 }
 
 impl Drop for LiveSocket {
     fn drop(&mut self) {
-        self.registry.socket_closed(&self.code);
+        self.registry.socket_closed(&self.room);
     }
 }
 
@@ -106,9 +163,9 @@ impl Registry {
     /// the room actor for durable effects (`None` to disable persistence).
     ///
     /// Retains nothing when the live-room cap is already met or when no free
-    /// join code is drawn within [`MAX_JOIN_CODE_ATTEMPTS`]. The new room
-    /// starts with no socket, so [`IDLE_WITHOUT_SOCKET`] removes it unless a
-    /// socket attaches first.
+    /// join code is drawn within [`MAX_JOIN_CODE_ATTEMPTS`]. The new room is
+    /// removed [`IDLE_WITHOUT_SOCKET`] after creation unless a host join is
+    /// acknowledged first ([`LiveSocket::host_joined`]).
     pub async fn create_room(
         self: &Arc<Self>,
         prompt_sets: Vec<PromptSet>,
@@ -123,7 +180,7 @@ impl Registry {
         db: Option<Db>,
         mut draw: impl FnMut() -> String,
     ) -> Result<NewRoom, CreateRoomError> {
-        let (code, host_token) = {
+        let (room, host_token) = {
             let mut rooms = self.write();
             if rooms.len() >= MAX_LIVE_ROOMS {
                 return Err(CreateRoomError::AtCapacity);
@@ -131,18 +188,33 @@ impl Registry {
             let code = allocate_code(&rooms, MAX_JOIN_CODE_ATTEMPTS, &mut draw)
                 .ok_or(CreateRoomError::NoJoinCode)?;
             let host_token = random_token();
-            let handle = spawn_room(code.clone(), prompt_sets, host_token.clone(), db);
+            let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
+            let (stop, stopped) = oneshot::channel();
+            let handle = spawn_room(
+                code.clone(),
+                prompt_sets,
+                host_token.clone(),
+                db,
+                async move {
+                    // Resolves with an error once the entry drops `stop`.
+                    let _ = stopped.await;
+                },
+            );
             rooms.insert(
                 code.clone(),
                 RetainedRoom {
                     handle,
+                    serial,
                     sockets: 0,
-                    idle_generation: INITIAL_IDLE_GENERATION,
+                    host_joined: false,
+                    idle_generation: 0,
+                    _stop: stop,
                 },
             );
-            (code, host_token)
+            (RoomInstance { code, serial }, host_token)
         };
-        self.arm_idle(code.clone(), INITIAL_IDLE_GENERATION);
+        let code = room.code.clone();
+        self.arm(room, Deadline::Creation);
         Ok(NewRoom { code, host_token })
     }
 
@@ -166,12 +238,16 @@ impl Registry {
             handle,
             LiveSocket {
                 registry: Arc::clone(self),
-                code: code.to_string(),
+                room: RoomInstance {
+                    code: code.to_string(),
+                    serial: room.serial,
+                },
             },
         ))
     }
 
-    /// Remove a room from the registry (its actor stops once all handles drop).
+    /// Remove a room from the registry and stop its actor, even while
+    /// connections still hold its handle: [`RoomHandle::closed`] resolves.
     pub async fn remove(&self, code: &str) -> bool {
         self.remove_room(code, |_| true)
     }
@@ -180,41 +256,52 @@ impl Registry {
         self.read().len()
     }
 
-    fn socket_closed(self: &Arc<Self>, code: &str) {
-        let generation = {
-            let mut rooms = self.write();
-            let Some(room) = rooms.get_mut(code) else {
-                return;
-            };
-            if room.sockets == 0 {
-                return;
-            }
-            room.sockets -= 1;
-            if room.sockets > 0 {
-                return;
-            }
-            room.idle_generation = room.idle_generation.wrapping_add(1);
-            room.idle_generation
-        };
-        self.arm_idle(code.to_string(), generation);
+    fn host_joined(&self, room: &RoomInstance) {
+        let mut rooms = self.write();
+        if let Some(retained) = retained_mut(&mut rooms, room) {
+            retained.host_joined = true;
+        }
     }
 
-    fn arm_idle(self: &Arc<Self>, code: String, generation: u64) {
+    fn socket_closed(self: &Arc<Self>, room: &RoomInstance) {
+        let generation = {
+            let mut rooms = self.write();
+            let Some(retained) = retained_mut(&mut rooms, room) else {
+                return;
+            };
+            retained.sockets -= 1;
+            if retained.sockets > 0 {
+                return;
+            }
+            retained.idle_generation = retained.idle_generation.wrapping_add(1);
+            retained.idle_generation
+        };
+        self.arm(room.clone(), Deadline::Idle(generation));
+    }
+
+    fn arm(self: &Arc<Self>, room: RoomInstance, deadline: Deadline) {
         let registry = Arc::downgrade(self);
         tokio::spawn(async move {
             tokio::time::sleep(IDLE_WITHOUT_SOCKET).await;
             let Some(registry) = registry.upgrade() else {
                 return;
             };
-            registry.reap_idle(&code, generation);
+            registry.reap(&room, deadline);
         });
     }
 
-    /// Idle removal goes through [`Self::remove_room`], the same map removal
-    /// [`Self::remove`] uses, and only while this empty interval is still current.
-    fn reap_idle(&self, code: &str, generation: u64) {
-        self.remove_room(code, |room| {
-            room.sockets == 0 && room.idle_generation == generation
+    /// Deadline removal goes through [`Self::remove_room`], the same map
+    /// removal [`Self::remove`] uses, and only while the room it was armed
+    /// for is retained and the deadline still holds.
+    fn reap(&self, room: &RoomInstance, deadline: Deadline) {
+        self.remove_room(&room.code, |retained| {
+            retained.is(room)
+                && match deadline {
+                    Deadline::Creation => !retained.host_joined,
+                    Deadline::Idle(generation) => {
+                        retained.sockets == 0 && retained.idle_generation == generation
+                    }
+                }
         });
     }
 
@@ -239,6 +326,16 @@ impl Registry {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// The entry for `room`'s join code, while it is still that room.
+fn retained_mut<'a>(
+    rooms: &'a mut HashMap<String, RetainedRoom>,
+    room: &RoomInstance,
+) -> Option<&'a mut RetainedRoom> {
+    rooms
+        .get_mut(&room.code)
+        .filter(|retained| retained.is(room))
 }
 
 fn allocate_code(
@@ -272,7 +369,6 @@ fn random_token() -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::sync::broadcast;
 
     fn sets() -> Vec<PromptSet> {
         vec![PromptSet {
@@ -290,10 +386,18 @@ mod tests {
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("room {code} was still retained with no socket");
+                panic!("room {code} was still retained past its deadline");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Attach a socket and record its acknowledged host join, as the
+    /// connection handler does once the room answers a host with `joined`.
+    async fn open_host_socket(reg: &Arc<Registry>, code: &str) -> (RoomHandle, LiveSocket) {
+        let (handle, socket) = reg.open_socket(code).await.unwrap();
+        socket.host_joined();
+        (handle, socket)
     }
 
     #[tokio::test]
@@ -314,7 +418,7 @@ mod tests {
         for _ in 0..50 {
             let room = reg.create_room(sets(), None).await.unwrap();
             assert!(codes.insert(room.code.clone()), "duplicate code generated");
-            sockets.push(reg.open_socket(&room.code).await.unwrap());
+            sockets.push(open_host_socket(&reg, &room.code).await);
         }
         assert_eq!(reg.count().await, 50);
     }
@@ -327,7 +431,7 @@ mod tests {
         for _ in 0..MAX_LIVE_ROOMS {
             let room = reg.create_room(sets(), None).await.unwrap();
             first.get_or_insert_with(|| room.code.clone());
-            sockets.push(reg.open_socket(&room.code).await.unwrap());
+            sockets.push(open_host_socket(&reg, &room.code).await);
         }
         let err = reg.create_room(sets(), None).await.unwrap_err();
         assert_eq!(err, CreateRoomError::AtCapacity);
@@ -382,26 +486,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_drops_the_registry_handle_so_the_actor_ends() {
+    async fn remove_stops_the_actor_while_a_handle_is_held() {
         let reg = Registry::new();
         let created = reg.create_room(sets(), None).await.unwrap();
         let handle = reg.get(&created.code).await.unwrap();
-        let mut events = handle.subscribe();
-        drop(handle);
         assert!(reg.remove(&created.code).await);
-        assert_actor_ended(&mut events).await;
+        assert_actor_stopped(&handle).await;
     }
 
     #[tokio::test]
-    async fn a_room_with_no_socket_is_removed_and_its_actor_ends() {
+    async fn a_room_with_no_socket_is_removed_and_its_actor_stops() {
         let reg = Registry::new();
         let created = reg.create_room(sets(), None).await.unwrap();
         let handle = reg.get(&created.code).await.unwrap();
-        let mut events = handle.subscribe();
-        drop(handle);
         until_removed(&reg, &created.code).await;
         assert_eq!(reg.count().await, 0);
-        assert_actor_ended(&mut events).await;
+        assert_actor_stopped(&handle).await;
+    }
+
+    #[tokio::test]
+    async fn a_room_whose_host_never_joins_is_removed_with_a_socket_attached_and_its_actor_stops() {
+        let reg = Registry::new();
+        let created = reg.create_room(sets(), None).await.unwrap();
+        // Like a connection, the test holds its own handle while its socket
+        // stays attached.
+        let (handle, _socket) = reg.open_socket(&created.code).await.unwrap();
+        until_removed(&reg, &created.code).await;
+        assert_eq!(reg.count().await, 0);
+        assert_actor_stopped(&handle).await;
+    }
+
+    #[tokio::test]
+    async fn a_removed_rooms_late_socket_close_leaves_a_new_room_with_its_code_retained() {
+        let reg = Registry::new();
+        reg.create_room_drawing(sets(), None, || "ABCD".into())
+            .await
+            .unwrap();
+        // No host join, so the creation deadline removes it with this socket
+        // still attached.
+        let (_removed_handle, removed_socket) = reg.open_socket("ABCD").await.unwrap();
+        until_removed(&reg, "ABCD").await;
+
+        reg.create_room_drawing(sets(), None, || "ABCD".into())
+            .await
+            .unwrap();
+        let (_handle, _socket) = open_host_socket(&reg, "ABCD").await;
+        drop(removed_socket);
+        tokio::time::sleep(IDLE_WITHOUT_SOCKET + Duration::from_millis(300)).await;
+        assert!(
+            reg.get("ABCD").await.is_some(),
+            "the removed room's socket close was counted against the new room"
+        );
     }
 
     #[tokio::test]
@@ -409,7 +544,7 @@ mod tests {
         let reg = Registry::new();
         let created = reg.create_room(sets(), None).await.unwrap();
         let code = created.code.clone();
-        let (_handle, socket) = reg.open_socket(&code).await.unwrap();
+        let (_handle, socket) = open_host_socket(&reg, &code).await;
         tokio::time::sleep(IDLE_WITHOUT_SOCKET + Duration::from_millis(300)).await;
         assert!(
             reg.get(&code).await.is_some(),
@@ -431,7 +566,7 @@ mod tests {
         let reg = Registry::new();
         let created = reg.create_room(sets(), None).await.unwrap();
         let code = created.code.clone();
-        let (_first, first) = reg.open_socket(&code).await.unwrap();
+        let (_first, first) = open_host_socket(&reg, &code).await;
         let (_second, second) = reg.open_socket(&code).await.unwrap();
         drop(first);
         tokio::time::sleep(IDLE_WITHOUT_SOCKET + Duration::from_millis(300)).await;
@@ -440,17 +575,21 @@ mod tests {
         until_removed(&reg, &code).await;
     }
 
-    async fn assert_actor_ended(events: &mut broadcast::Receiver<crate::protocol::ServerMsg>) {
-        tokio::select! {
-            ended = events.recv() => {
-                assert!(
-                    matches!(ended, Err(broadcast::error::RecvError::Closed)),
-                    "actor dropped its broadcast sender, got {ended:?}"
-                );
-            }
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                panic!("room actor was still running after registry removal");
-            }
-        }
+    /// The actor has stopped even though `handle` is still held.
+    async fn assert_actor_stopped(handle: &RoomHandle) {
+        tokio::time::timeout(Duration::from_secs(5), handle.closed())
+            .await
+            .expect("room actor was still running after its removal");
+        let (direct, _replies) = crate::direct::channel();
+        let ping = crate::room::Command {
+            intent: crate::protocol::ClientMsg::Ping,
+            role: crate::protocol::Role::Display,
+            name: None,
+            direct,
+        };
+        assert!(
+            handle.dispatch(ping).await.is_err(),
+            "a stopped room actor accepted a command"
+        );
     }
 }

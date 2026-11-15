@@ -69,7 +69,11 @@ async fn final_responses_and_archive_persist_to_postgres() {
         .await
         .expect("create room");
     let code = room.code.clone();
-    let handle = registry.get(&code).await.unwrap();
+    // The test fires host intents straight at the actor. Recording a host join
+    // on an attached socket, as the connection handler does, keeps the room
+    // past its creation deadline while it runs.
+    let (handle, host_socket) = registry.open_socket(&code).await.expect("open socket");
+    host_socket.host_joined();
 
     // Host builds the roster and opens submissions.
     for name in ["Ann", "Bo"] {
