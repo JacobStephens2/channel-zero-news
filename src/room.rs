@@ -15,14 +15,20 @@
 //!   channel: one that overflows closes its connection instead.
 //! * The actor stops when the registry removes the room, even while
 //!   connections still hold handles; [`RoomHandle::closed`] tells them.
+//! * A command the room accepts and broadcasts as a state change is room
+//!   activity. [`RoomHandle::inactive_for`] resolves once a room has gone a
+//!   given time without any, which is how the registry removes rooms no one
+//!   is playing in.
 //!
 //! Keeping the reducer pure ([`apply`] takes `&mut GameState` and returns a
 //! [`Reaction`]) means the entire command surface is unit-testable without
 //! spinning up tasks or sockets.
 
 use std::future::Future;
+use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::time::Instant;
 
 use crate::db::Db;
 use crate::direct::DirectSender;
@@ -77,6 +83,13 @@ impl Reaction {
             effects: vec![],
         }
     }
+
+    /// Whether the command was room activity: an intent the room accepted
+    /// and broadcasts as a state change. Pings, joins that add no player and
+    /// rejected intents only reply to their own connection.
+    fn is_activity(&self) -> bool {
+        !self.broadcasts.is_empty()
+    }
 }
 
 /// A cloneable handle to a running room actor.
@@ -86,6 +99,9 @@ pub struct RoomHandle {
     pub host_token: String,
     cmd_tx: mpsc::Sender<Command>,
     events_tx: broadcast::Sender<ServerMsg>,
+    /// When the room last had activity, or was created. The actor holds the
+    /// only sender, so the channel closes when it stops.
+    last_activity: watch::Receiver<Instant>,
 }
 
 /// Returned when a room's actor task has stopped.
@@ -108,6 +124,32 @@ impl RoomHandle {
     pub async fn closed(&self) {
         self.cmd_tx.closed().await;
     }
+
+    /// Resolves once the room has gone `limit` without room activity,
+    /// counted from its creation or its last activity: an intent it accepted
+    /// and broadcast as a state change. Resolves with [`RoomClosed`] instead
+    /// once the actor stops. It does not borrow the handle.
+    pub fn inactive_for(
+        &self,
+        limit: Duration,
+    ) -> impl Future<Output = Result<(), RoomClosed>> + Send + 'static {
+        let mut last_activity = self.last_activity.clone();
+        async move {
+            loop {
+                let deadline = *last_activity.borrow_and_update() + limit;
+                tokio::select! {
+                    // Activity at the deadline still counts.
+                    biased;
+                    changed = last_activity.changed() => {
+                        if changed.is_err() {
+                            return Err(RoomClosed);
+                        }
+                    }
+                    () = tokio::time::sleep_until(deadline) => return Ok(()),
+                }
+            }
+        }
+    }
 }
 
 /// Spawn a room actor and return a handle to it. `db` is `None` in tests and
@@ -127,6 +169,7 @@ pub fn spawn_room(
     let host_token = host_token.into();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
     let (events_tx, _events_rx) = broadcast::channel(BROADCAST_BUFFER);
+    let (activity_tx, last_activity) = watch::channel(Instant::now());
 
     let state = GameState::new(code.clone(), prompt_sets);
     tokio::spawn(run(
@@ -134,6 +177,7 @@ pub fn spawn_room(
         host_token.clone(),
         cmd_rx,
         events_tx.clone(),
+        activity_tx,
         db,
         stop,
     ));
@@ -143,6 +187,7 @@ pub fn spawn_room(
         host_token,
         cmd_tx,
         events_tx,
+        last_activity,
     }
 }
 
@@ -152,6 +197,7 @@ async fn run(
     host_token: String,
     mut cmd_rx: mpsc::Receiver<Command>,
     events_tx: broadcast::Sender<ServerMsg>,
+    activity_tx: watch::Sender<Instant>,
     db: Option<Db>,
     stop: impl Future<Output = ()>,
 ) {
@@ -171,6 +217,9 @@ async fn run(
             cmd.name.as_deref(),
             cmd.intent,
         );
+        if reaction.is_activity() {
+            activity_tx.send_replace(Instant::now());
+        }
         for msg in reaction.broadcasts {
             // Errs only when there are zero subscribers — fine to ignore.
             let _ = events_tx.send(msg);
