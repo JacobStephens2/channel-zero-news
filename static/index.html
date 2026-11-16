@@ -178,6 +178,11 @@ const $ = (id) => document.getElementById(id);
 
 const session = createRoomSession({
   createSocket: () => new WebSocket(wsUrl()),
+  requestRoom: async () => {
+    const response = await fetch("/api/rooms", { method: "POST" });
+    if (!response.ok) throw new Error("create failed");
+    return response.json();
+  },
   storage: {
     getItem: (key) => sessionStorage.getItem(key),
     setItem: (key, value) => sessionStorage.setItem(key, value),
@@ -222,16 +227,7 @@ function applyRoleUI() {
 $("role").addEventListener("change", applyRoleUI);
 
 // ---- create room (host) ----
-$("createBtn").addEventListener("click", async () => {
-  const res = await fetch("/api/rooms", { method: "POST" });
-  if (!res.ok) { alert("create failed"); return; }
-  const data = await res.json();
-  $("code").value = data.code;
-  $("hostCreds").classList.remove("hidden");
-  $("hostCreds").innerHTML = `Room <code>${data.code}</code> created. Players join with this code. Host token held in this tab.`;
-  log("REST", { created: data.code });
-  session.connect({ code: data.code, role: "host", hostToken: data.host_token });
-});
+$("createBtn").addEventListener("click", () => session.create());
 
 // ---- connect / join ----
 $("joinBtn").addEventListener("click", () => session.connect({
@@ -245,7 +241,11 @@ function renderSession(view) {
     joined: "connected", failed: "error", disconnected: "disconnected" })[view.state];
   $("roomPill").textContent = view.code ? `Room ${view.code}` : "";
   $("roomPill").classList.toggle("hidden", view.state !== "joined");
+  $("hostCreds").textContent = view.role === "host"
+    ? `Room ${view.code}. Players join with this code. Host token held in this tab.` : "";
+  $("hostCreds").classList.toggle("hidden", view.role !== "host");
   if (view.state === "connecting") {
+    if (view.role === "host") $("code").value = view.code;
     $("phasePill").textContent = "—";
     $("progressLine").textContent = "Joining room…";
     $("playerList").innerHTML = "";

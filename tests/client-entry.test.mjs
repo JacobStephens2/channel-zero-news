@@ -1,12 +1,210 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { loadClient } from "./client-entry-harness.mjs";
-import { measureSlide, memoryStorage } from "./client-adapters.mjs";
+import { deferredRoomRequest, loadClient } from "./client-entry-harness.mjs";
+import { deferred, measureSlide, memoryStorage } from "./client-adapters.mjs";
 
 const room = (phase, submitted = false) => ({ type: "room_state", room: {
   code: "AAAA", phase, current_slide: 0, total_slides: 10,
   players: [{ name: "Ann", submitted }, { name: "Bo", submitted: false }],
 } });
+
+test("late creation cannot replace an acknowledged manual player connection", async () => {
+  const response = deferred();
+  const h = await loadClient({ fetch: () => response.promise });
+  await h.editRole("host");
+  const creation = h.click("createBtn");
+  await h.editRole("player");
+  h.element("code").value = "PLAY"; h.element("pname").value = "Ann";
+  await h.click("joinBtn");
+  const player = h.sockets[0]; player.open(); player.message({ type: "joined", role: "player", name: "Ann" });
+  const operations = h.storage.operations.length, log = h.element("log").textContent;
+  response.resolve({ ok: true, json: async () => ({ code: "HOST", host_token: "secret" }) });
+  await creation;
+  assert.equal(player.closed, false);
+  assert.equal(h.sockets.length, 1);
+  assert.equal(h.element("conn").textContent, "connected");
+  assert.equal(h.element("code").value, "PLAY");
+  assert.equal(h.element("hostCreds").textContent, "");
+  assert.equal(h.element("hostCreds").classList.contains("hidden"), true);
+  assert.equal(h.element("log").textContent, log);
+  assert.equal(h.storage.operations.length, operations);
+  assert.deepEqual(h.alerts, []);
+});
+
+function presentation(h) {
+  const ids = ["conn", "roomPill", "hostCreds", "phasePill", "progressLine", "playerList",
+    "promptFields", "partnerLine", "slide", "slideIdx", "log", "hostPanel", "playerPanel", "readerControls"];
+  return { elements: ids.map((id) => { const el = h.element(id); return {
+    id, text: el.textContent, html: el.innerHTML, hidden: el.classList.contains("hidden"),
+  }; }), code: h.element("code").value, drafts: h.textareas().map((el) => el.value),
+    signoff: h.document.getElementById("signoff")?.value,
+    stage: h.document.body.classList.contains("stage-mode"),
+    full: h.element("slidePanel").classList.contains("full"),
+    font: h.element("slide").style.fontSize, alerts: [...h.alerts],
+    operations: [...h.storage.operations],
+    sockets: h.sockets.map((socket) => ({ closed: socket.closed, sent: [...socket.sent] })) };
+}
+
+async function joinPlayer(h) {
+  h.element("code").value = "PLAY"; h.element("pname").value = "Ann";
+  await h.click("joinBtn");
+  const socket = h.sockets.at(-1); socket.open(); socket.message({ type: "joined", role: "player", name: "Ann" });
+  socket.message(room("collecting"));
+  socket.message({ type: "assignment", partner: "Bo", prompts: ["Tonight"] });
+  h.textareas()[0].value = "Unsent news"; h.element("signoff").value = "Good night";
+  return socket;
+}
+
+test("pending creation keeps draft submissions and accepted events usable and resets only on success", async () => {
+  const request = deferredRoomRequest(), h = await loadClient({ fetch: request.fetch });
+  const player = await joinPlayer(h);
+  await h.editRole("host");
+  const before = presentation(h), creation = h.click("createBtn");
+  assert.deepEqual(presentation(h), before);
+  request.respond(); await request.decoding.promise;
+  assert.deepEqual(presentation(h), before, "headers alone do not replace the game");
+  await h.click("submitBtn");
+  assert.deepEqual(player.sent.at(-1), { type: "submit_responses", responses: ["Unsent news"], signoff: "Good night" });
+  player.message({ type: "pong" });
+  assert.match(h.element("log").textContent, /pong/);
+  assert.equal(h.textareas()[0].value, "Unsent news");
+  request.body.resolve({ code: " host ", host_token: "secret" });
+  await creation;
+  assert.equal(player.closed, true);
+  assert.equal(h.sockets.length, 2);
+  assert.equal(h.element("conn").textContent, "connecting…");
+  assert.equal(h.element("code").value, "HOST");
+  assert.equal(h.element("promptFields").innerHTML, "");
+  assert.equal(h.element("phasePill").textContent, "—");
+  assert.deepEqual(h.storage.saved(), { code: "PLAY", role: "player", name: "Ann", hostToken: null });
+});
+
+const httpFailures = {
+  "request rejection": (request) => request.response.reject(new Error("secret request detail")),
+  "unsuccessful HTTP response": (request) => request.respond(false),
+  "body rejection": (request) => { request.respond(); request.body.reject(new Error("secret body detail")); },
+  "non-object response": (request) => { request.respond(); request.body.resolve(null); },
+  "array response": (request) => { request.respond(); request.body.resolve([]); },
+  "invalid code": (request) => { request.respond(); request.body.resolve({ code: 9, host_token: "secret" }); },
+  "invalid token": (request) => { request.respond(); request.body.resolve({ code: "HOST", host_token: " " }); },
+};
+
+for (const [failure, fail] of Object.entries(httpFailures)) {
+  test(`current ${failure} reports once while preserving the active game`, async () => {
+    const request = deferredRoomRequest(), h = await loadClient({ fetch: request.fetch });
+    const player = await joinPlayer(h);
+    player.message(room("performing"));
+    player.message({ type: "slide_changed", index: 2, total_slides: 10, controller: "Ann",
+      slide: { kind: "script", reader: "Ann", text: "Current performance" } });
+    await h.editRole("host");
+    const before = presentation(h), creation = h.click("createBtn");
+    assert.deepEqual(presentation(h), before);
+    fail(request); await creation;
+    const after = presentation(h);
+    assert.deepEqual(after, { ...before, alerts: ["create failed"], elements: before.elements.map((el) =>
+      el.id === "log" ? { ...el, text: h.element("log").textContent } : el) });
+    assert.equal(h.element("log").textContent.split("create failed").length, 2);
+    assert.doesNotMatch(h.element("log").textContent, /secret/);
+    await h.click("rNext");
+    assert.deepEqual(player.sent.at(-1), { type: "advance_slide" });
+    player.message({ type: "pong" });
+    assert.match(h.element("log").textContent, /pong/);
+  });
+}
+
+test("synchronous fetch errors are handled by the delegated create click", async () => {
+  const h = await loadClient({ fetch() { throw new Error("private failure"); } });
+  await h.editRole("host");
+  await h.click("createBtn");
+  assert.deepEqual(h.alerts, ["create failed"]);
+  assert.equal(h.sockets.length, 0);
+  assert.equal(h.storage.operations.length, 1, "only initial restoration accessed storage");
+  assert.equal(h.element("hostCreds").textContent, "");
+});
+
+test("stale HTTP responses and JSON bodies cannot change newer player or display presentation", async () => {
+  for (const role of ["player", "display"]) for (const decodedHeaders of [false, true]) {
+    for (const acknowledged of [false, true]) for (const result of ["success", "malformed", "rejection"]) {
+      const request = deferredRoomRequest(), h = await loadClient({ fetch: request.fetch });
+      await h.editRole("host");
+      const creation = h.click("createBtn");
+      if (decodedHeaders) { request.respond(); await request.decoding.promise; }
+      await h.editRole(role);
+      h.element("code").value = "NEW"; h.element("pname").value = "Ann";
+      await h.click("joinBtn");
+      const socket = h.sockets[0];
+      if (acknowledged) { socket.open(); socket.message({ type: "joined", role, name: role === "player" ? "Ann" : null }); }
+      const before = presentation(h);
+      if (result === "rejection") {
+        (decodedHeaders ? request.body : request.response).reject(new Error("stale private detail"));
+      } else {
+        request.respond();
+        request.body.resolve(result === "success" ? { code: "HOST", host_token: "secret" } : { code: "HOST", host_token: " " });
+      }
+      await creation;
+      assert.deepEqual(presentation(h), before, `${role}, headers=${decodedHeaders}, joined=${acknowledged}, ${result}`);
+    }
+  }
+});
+
+test("two creates obey invocation order with independent HTTP headers and JSON bodies", async () => {
+  for (const olderFirst of [false, true]) for (const decodedHeaders of [false, true]) {
+    const older = deferredRoomRequest(), newer = deferredRoomRequest(), requests = [older, newer];
+    const h = await loadClient({ fetch: () => requests.shift().fetch() });
+    await h.editRole("host");
+    const first = h.click("createBtn");
+    if (decodedHeaders) { older.respond(); await older.decoding.promise; }
+    const second = h.click("createBtn");
+    const finishOlder = async () => {
+      older.respond(); older.body.resolve({ code: "OLD", host_token: "old-secret" }); await first;
+    };
+    if (olderFirst) {
+      const before = presentation(h); await finishOlder(); assert.deepEqual(presentation(h), before);
+    }
+    newer.respond(); newer.body.resolve({ code: "NEW", host_token: "new-secret" }); await second;
+    const socket = h.sockets[0]; socket.open(); socket.message({ type: "joined", role: "host" });
+    const before = presentation(h);
+    if (!olderFirst) { await finishOlder(); assert.deepEqual(presentation(h), before); }
+    assert.equal(h.sockets.length, 1);
+    assert.equal(h.element("code").value, "NEW");
+    assert.deepEqual(socket.sent[0], { type: "join_room", code: "NEW", role: "host", name: null, token: "new-secret" });
+    assert.deepEqual(h.storage.saved(), { code: "NEW", role: "host", name: null, hostToken: "new-secret" });
+  }
+});
+
+test("accepted host notice renders normalized code as text and later edits remain pending", async () => {
+  const h = await loadClient({ fetch: async () => ({ ok: true,
+    json: async () => ({ code: " <b>host</b> ", host_token: "private-token" }) }) });
+  await h.editRole("host"); await h.click("createBtn");
+  assert.equal(h.element("code").value, "<B>HOST</B>");
+  assert.equal(h.element("hostCreds").textContent, "Room <B>HOST</B>. Players join with this code. Host token held in this tab.");
+  assert.equal(h.element("hostCreds").innerHTML, "");
+  assert.equal(h.element("hostCreds").classList.contains("hidden"), false);
+  assert.doesNotMatch(h.element("log").textContent, /private-token|REST|host_token/);
+  h.element("code").value = "PENDING";
+  const host = h.sockets[0]; host.open(); host.message({ type: "joined", role: "host" });
+  assert.equal(h.element("code").value, "PENDING");
+  assert.match(h.element("hostCreds").textContent, /<B>HOST<\/B>/);
+  assert.doesNotMatch(h.element("hostCreds").textContent, /private-token|host_token|hostToken/);
+  await h.editRole("display");
+  await h.click("joinBtn");
+  assert.equal(h.element("hostCreds").classList.contains("hidden"), true);
+  assert.equal(h.element("hostCreds").textContent, "");
+});
+
+test("restored hosts get the accepted host notice without a creation request", async () => {
+  const saved = { code: " host ", role: "host", name: null, hostToken: "private-token" };
+  const h = await loadClient({ storage: memoryStorage(JSON.stringify(saved)),
+    fetch() { throw new Error("restoration must not create a room"); } });
+  assert.equal(h.element("code").value, "HOST");
+  assert.equal(h.element("hostCreds").classList.contains("hidden"), false);
+  assert.equal(h.element("hostCreds").textContent, "Room HOST. Players join with this code. Host token held in this tab.");
+  h.element("code").value = "PENDING";
+  h.sockets[0].open(); h.sockets[0].message({ type: "joined", role: "host" });
+  assert.equal(h.element("code").value, "PENDING");
+  assert.doesNotMatch(h.element("hostCreds").textContent, /private-token/);
+  assert.deepEqual(h.alerts, []);
+});
 
 test("one player connection acquires fresh assignments across consecutive rounds", async () => {
   const h = await loadClient();

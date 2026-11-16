@@ -18,9 +18,10 @@ const joinMessage = ({ code, role, name, hostToken }) =>
 
 // One tab's connection and recovery owner. DOM and authoritative game state
 // stay with the caller and server respectively. Storage is accessed lazily.
-export function createRoomSession({ createSocket, storage, onChange = () => {},
+export function createRoomSession({ createSocket, requestRoom, storage, onChange = () => {},
   onMessage = () => {}, onError = () => {}, onSend = () => {} }) {
   let attempt = null;
+  let acquisition = null;
   let current = Object.freeze({ state: "idle", acknowledged: false, code: null, role: null, name: null });
   const owns = (candidate) => attempt === candidate && !candidate.terminal;
 
@@ -56,10 +57,8 @@ export function createRoomSession({ createSocket, storage, onChange = () => {},
     } catch {}
   }
 
-  function start(credentials, restoring = false) {
-    let identity;
-    try { identity = capture(credentials); }
-    catch (error) { onError(error.message); return false; }
+  function start(identity, restoring = false) {
+    acquisition = null;
     const previous = attempt;
     const candidate = { identity, restoring,
       socket: null, acknowledged: false, terminal: false };
@@ -116,6 +115,32 @@ export function createRoomSession({ createSocket, storage, onChange = () => {},
     return true;
   }
 
+  function connect(credentials) {
+    let identity;
+    try { identity = capture(credentials); }
+    catch (error) { onError(error.message); return false; }
+    return start(identity);
+  }
+
+  async function create() {
+    const pending = {};
+    acquisition = pending;
+    let identity;
+    try {
+      const response = await requestRoom();
+      if (acquisition !== pending) return false;
+      if (!response || typeof response !== "object" || Array.isArray(response)) throw new Error();
+      identity = capture({ code: response.code, role: "host", hostToken: response.host_token });
+    } catch {
+      if (acquisition === pending) {
+        acquisition = null;
+        onError("create failed");
+      }
+      return false;
+    }
+    return start(identity);
+  }
+
   function restore() {
     let record;
     try { record = storage.getItem(SESSION_KEY); } catch { return false; }
@@ -139,6 +164,6 @@ export function createRoomSession({ createSocket, storage, onChange = () => {},
     return transmit(attempt, message);
   }
 
-  return Object.freeze({ connect: (credentials) => start(credentials), restore, send,
+  return Object.freeze({ create, connect, restore, send,
     get current() { return current; } });
 }

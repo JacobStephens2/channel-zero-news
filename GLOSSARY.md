@@ -5,9 +5,10 @@ retained room, its actor-acknowledged identity, same-identity replays, bounded
 direct replies, live broadcasts and termination; it owns neither a tab's Room
 session nor authoritative game state.
 
-**Room session**: a tab's current attempt to join one room with one role and
-optional player name, together with its acknowledged identity and per-tab
-recovery record; it does not own the room's authoritative game state.
+**Room session**: a tab's current connection and attempt to create or join one
+room with one role and optional player name, including pending acquisition of
+host credentials, acknowledged identity, and its per-tab recovery record; it
+does not own authoritative game state.
 
 **Player round participation**: one acknowledged player's assignment acquisition,
 draft responses and sign-off, submission acknowledgement, and prompt-form

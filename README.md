@@ -152,11 +152,32 @@ cargo test --locked
 
 The VM modules flag lets the wiring harness execute the actual inline client
 module and its three allowed imports against controlled browser adapters. Session
-tests drive the public `connect`, `restore`, `send`, and read-only `current`
+tests drive the public `create`, `connect`, `restore`, `send`, and read-only `current`
 interface in `static/room-session.mjs`. The existing static router serves all three
 native modules directly; `tests/full_flow.rs` checks their production imports,
 URLs, source bodies, and JavaScript content types. The database test skips its
 DB assertions when `DATABASE_URL` is unset.
+
+Room session acquires host credentials through its asynchronous `requestRoom()`
+adapter. `create()` returns a promise of `true` when still-current, validated
+credentials construct a socket, or `false` for superseded acquisition or an
+operational failure; it does not wait for `joined`. The HTTP adapter only posts
+to `/api/rooms`, rejects unsuccessful responses, and returns the decoded payload.
+Room session validates and captures that payload, owns ordering across creation,
+valid manual joins and valid restoration, and reports current acquisition errors
+as `create failed`. Superseded completions are silent, including failures and
+late JSON bodies. Invalid joins or missing/invalid recovery do not supersede
+pending creation.
+
+Pending or failed acquisition preserves the active connection, event delivery,
+sends, Player round participation drafts, Performance stage and acknowledged
+recovery record. Only a current successful acquisition enters `connecting` and
+resets presentation through the existing session view. The entry delegates its
+create click and renders the accepted host code as text from that view, including
+restored hosts; later form edits remain pending input. Host credentials are sent
+when the captured socket opens and saved in the unchanged `cz_session` record
+only after its join acknowledgement. No acquisition lifecycle state, retry,
+client build step or authoritative game state is added.
 
 `tests/room_connection.rs` drives the production runner with the real registry
 and actor. `tests/common/connection.rs` supplies a framed input stream and a

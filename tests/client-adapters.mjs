@@ -1,4 +1,10 @@
 // Controlled browser boundaries shared by client interface and entry tests.
+export function deferred() {
+  let resolve, reject;
+  const promise = new Promise((accept, decline) => { resolve = accept; reject = decline; });
+  return { promise, resolve, reject };
+}
+
 export class ControlledSocket {
   readyState = 0;
   sent = [];
