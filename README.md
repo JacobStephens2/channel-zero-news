@@ -33,10 +33,11 @@ channel-zero/
     ├── routes.rs        REST: create/join room, prompt sets
     ├── ws.rs            WebSocket upgrade + frame/JSON conversion
     ├── connection.rs    Room connection admission, identity, delivery + termination
-    ├── room.rs          per-room actor (owns state) + broadcast fan-out + pure reducer
+    ├── room.rs          per-room actor: command queue, delivery + effect execution
+    ├── room_game.rs     opaque, pure Room game: intents → ordered reactions
     ├── direct.rs        per-connection direct reply channel (fixed capacity)
     ├── registry.rs      in-memory map of live rooms by join code
-    ├── state.rs         GameState machine (lobby→collecting→performing→archived)
+    ├── state.rs         shared game value types + limits
     ├── protocol.rs      serde message enums (client intents ↔ server events)
     ├── db.rs            SQLx persistence
     └── error.rs         typed error → HTTP/WS responses
@@ -44,10 +45,10 @@ channel-zero/
 
 ### Concurrency model (the centerpiece)
 
-Each room is a **single Tokio task that owns its `GameState`** — there are no
+Each room is a **single Tokio task that owns its opaque `RoomGame`** — there are no
 locks around game state, and all mutation is serialized through one `mpsc`
 command queue, so torn reads/writes are impossible. Connections send *intents*;
-the actor reduces each with a pure function and:
+the actor calls `RoomGame::apply(role, name, intent)` and:
 
 * fans **broadcast** events (room state, submission progress, slide changes) out
   to every subscriber via a `tokio::sync::broadcast` channel, and
@@ -59,6 +60,17 @@ the actor reduces each with a pure function and:
 
 The server is the single source of truth. Clients render state and send intents;
 they never send state.
+
+Room game is synchronous and pure. `RoomGame::new(code, prompt_sets, host_token)`
+captures room metadata, the catalog and host credential once; `apply` is its only
+intent operation. It owns roster/round transitions, authorization, assignments,
+join replay, slides and ordered `Reaction` vectors (`broadcasts`, `direct`,
+`effects`). Mutable representation, raw transitions and projection helpers are
+private to `room_game.rs`. The actor supplies trusted connection role/name,
+retains immutable room-code metadata and executes effects sequentially after
+delivery enqueueing. Shared `PromptSet`, `Phase`, `Slide`, `ArchivedEntry` and
+limits remain at their existing `state` import paths. There is no state getter
+or free reducer entry point.
 
 `connection::run(registry, incoming, outgoing)` owns one Room connection. Both
 the WebSocket adapter and controlled in-process adapters supply a standard
@@ -93,7 +105,8 @@ Host, player, and display screen are all WebSocket clients distinguished by
 must present the secret token issued by `POST /api/rooms`) and held in
 server memory thereafter — the client cannot re-assert or escalate it.
 Host-only actions (open submissions, start, advance slides, archive) are
-enforced in the actor, not just the UI.
+enforced by Room game using the actor's trusted context, not just the UI. Host
+join/replay intents still validate the captured host token every time.
 
 ### Persistence boundary
 
@@ -103,8 +116,10 @@ enforced in the actor, not just the UI.
   submitted answers, current slide — everything that changes during a game.
 * **In Postgres**: the prompt-set catalog, each room's *finalized* responses
   (written when the game starts), and the append-only archive of past rounds
-  (written on archive, which also clears the live responses — mirroring the
-  original insert-select-then-delete).
+  (written on archive, which also clears the database's current responses —
+  mirroring the original insert-select-then-delete). Archive retains the
+  in-memory roster/responses and slide index; NewRound clears them for an empty
+  lobby.
 
 A dropped connection cannot corrupt a room: state only changes on explicit
 intents, so a player can disconnect mid-submission and reconnect to resubmit.
@@ -185,8 +200,14 @@ gated server-event sink, so tests can queue room mutations while a specific
 write is pending and verify snapshots, replay, overflow isolation and guard
 release through the interface. `tests/persistence.rs` uses admitted host/player
 connections too; its Ping/Pong barrier still waits for earlier actor commands
-and their ordered durable effects. Pure reducer/game-transition tests and the
-focused direct-channel overflow test remain independent. `tests/full_flow.rs`
+and their ordered durable effects. `tests/room_game.rs` replaces the former
+state-transition and reducer suites: deterministic traces construct fixtures
+through `RoomGame` commands and observe returned reactions or later join
+replays, using the same interface as the real actor. These tests cover roster
+limits, authorization and validation precedence, assignments, all round phases,
+ordered/routed events, full slide content/navigation and owned effect snapshots.
+Run them with `cargo test --locked --test room_game`. The focused direct-channel
+overflow test remains independent. `tests/full_flow.rs`
 retains real WebSocket framing, all-role, replay and overflow regressions.
 
 `static/player-round-participation.mjs` owns Player round participation. The entry

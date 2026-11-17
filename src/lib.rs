@@ -11,6 +11,7 @@ pub mod error;
 pub mod protocol;
 pub mod registry;
 pub mod room;
+pub mod room_game;
 pub mod routes;
 pub mod state;
 pub mod ws;
