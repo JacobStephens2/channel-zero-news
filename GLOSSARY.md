@@ -1,5 +1,10 @@
 # Glossary
 
+**Room game**: the authoritative in-memory rules for one room, including roster
+and round transitions, intent authorization, assignments, slides, and ordered
+event and durable-effect descriptions; it owns neither Room connection delivery
+nor durable-effect execution.
+
 **Room connection**: The server-side lifetime of one socket's attempt to join a
 retained room, its actor-acknowledged identity, same-identity replays, bounded
 direct replies, live broadcasts and termination; it owns neither a tab's Room
