@@ -11,16 +11,13 @@ use channel_zero::app::{build_router, AppState};
 use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
 use channel_zero::state::{Phase, PromptSet, Slide, MAX_PLAYER_NAME_CHARS, MAX_ROSTER_PLAYERS};
 use futures_util::SinkExt;
-use tokio::net::TcpStream;
 use tokio::time::Instant;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::Message;
 
 #[path = "common/mod.rs"]
 mod common;
 
-use common::recv_until;
-
-type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+use common::{connect, create_room, join, recv_until, send};
 
 fn prompt_sets() -> Vec<PromptSet> {
     vec![PromptSet {
@@ -79,49 +76,6 @@ async fn client_native_modules_are_served_without_a_build_step() {
         );
         assert_eq!(module.text().await.unwrap(), source, "{path}");
     }
-}
-
-async fn send(ws: &mut Ws, msg: &ClientMsg) {
-    ws.send(Message::Text(serde_json::to_string(msg).unwrap()))
-        .await
-        .unwrap();
-}
-
-async fn connect(addr: &str) -> Ws {
-    let (ws, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
-    ws
-}
-
-/// Create a room over REST, returning its join code and host token.
-async fn create_room(addr: &str) -> (String, String) {
-    let created: serde_json::Value = reqwest::Client::new()
-        .post(format!("http://{addr}/api/rooms"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    (
-        created["code"].as_str().unwrap().to_string(),
-        created["host_token"].as_str().unwrap().to_string(),
-    )
-}
-
-/// Connect and send `msg`, a `JoinRoom`, returning the socket once the server
-/// acknowledges the role it asked for.
-async fn join(addr: &str, msg: &ClientMsg) -> Ws {
-    let ClientMsg::JoinRoom { role, .. } = msg else {
-        panic!("join needs a JoinRoom message, got {msg:?}");
-    };
-    let mut ws = connect(addr).await;
-    send(&mut ws, msg).await;
-    let joined = recv_until(&mut ws, |m| matches!(m, ServerMsg::Joined { .. })).await;
-    assert!(
-        matches!(joined, ServerMsg::Joined { role: acked, .. } if acked == *role),
-        "asked to join as {role:?}, got {joined:?}"
-    );
-    ws
 }
 
 #[tokio::test]
