@@ -137,3 +137,84 @@ fn random_batch_id() -> String {
     let bytes: [u8; 16] = rng.gen();
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+#[cfg(test)]
+mod removal_regression {
+    use super::*;
+    use crate::client_address::ClientAddress;
+    use crate::direct;
+    use crate::protocol::{ClientMsg, Role};
+    use crate::registry::Registry;
+    use crate::room::Command;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn removing_room_cancels_a_blocked_database_effect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(60))
+            .connect_lazy(&format!(
+                "postgres://review:review@{}/review?sslmode=disable",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+        let registry = Registry::new();
+        let room = registry
+            .create_room(
+                ClientAddress::NO_PEER,
+                vec![PromptSet {
+                    id: 1,
+                    name: "Review".into(),
+                    author: "Review".into(),
+                    prompts: vec![],
+                }],
+                Some(Db { pool }),
+            )
+            .await
+            .unwrap();
+        let (handle, socket) = registry.open_socket(&room.code).await.unwrap();
+        socket.host_joined();
+        let (direct, _replies) = direct::channel();
+        for (intent, role, name) in [
+            (
+                ClientMsg::AddPlayer { name: "Ann".into() },
+                Role::Host,
+                None,
+            ),
+            (ClientMsg::StartCollecting, Role::Host, None),
+            (
+                ClientMsg::SubmitResponses {
+                    responses: vec![],
+                    signoff: "s".into(),
+                },
+                Role::Player,
+                Some("Ann".to_string()),
+            ),
+            (ClientMsg::StartGame, Role::Host, None),
+        ] {
+            handle
+                .dispatch(Command {
+                    intent,
+                    role,
+                    name,
+                    direct: direct.clone(),
+                })
+                .await
+                .unwrap();
+        }
+        // SQLx is now inside the effect, waiting for PostgreSQL's startup reply.
+        let (_unanswered_database_connection, _) =
+            tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .expect("StartGame never reached persistence")
+                .unwrap();
+        assert!(registry.remove(&room.code).await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), handle.closed())
+                .await
+                .is_ok(),
+            "a removed actor is still awaiting its database effect"
+        );
+    }
+}

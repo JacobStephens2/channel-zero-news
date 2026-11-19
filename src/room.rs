@@ -202,7 +202,7 @@ async fn run(
     stop: impl Future<Output = ()>,
 ) {
     tokio::pin!(stop);
-    loop {
+    'commands: loop {
         let next = tokio::select! {
             // A stopped room takes no further command, even one already queued.
             biased;
@@ -230,7 +230,13 @@ async fn run(
             cmd.direct.send(msg);
         }
         for effect in reaction.effects {
-            run_effect(&db, &state.code, effect).await;
+            // Persistence is best-effort: a stalled write cannot keep a
+            // removed room's actor or sockets alive.
+            tokio::select! {
+                biased;
+                () = &mut stop => break 'commands,
+                () = run_effect(&db, &state.code, effect) => {}
+            }
         }
     }
     tracing::debug!(room = %state.code, "room actor stopped");

@@ -498,3 +498,68 @@ async fn bytes_a_client_sends_before_the_entry_apache_appends_do_not_lift_its_qu
     assert_eq!(running.state.registry.count().await, 8);
     drop(sockets);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removal_closes_a_socket_stalled_writing_its_initial_joined_reply() {
+    let running = spawn_server(Peers::Unknown).await;
+    let addr = serve_with_small_send_buffers(running.state.clone()).await;
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(SMALL_SOCKET_BUFFER).unwrap();
+    let stream = socket.connect(addr.parse().unwrap()).await.unwrap();
+    let (mut stalled, _) = client_async(format!("ws://{addr}/ws"), MaybeTlsStream::Plain(stream))
+        .await
+        .unwrap();
+    let room = running
+        .state
+        .registry
+        .create_room(ClientAddress::NO_PEER, prompt_sets(), None)
+        .await
+        .unwrap();
+    let (handle, host_guard) = running
+        .state
+        .registry
+        .open_socket(&room.code)
+        .await
+        .unwrap();
+    host_guard.host_joined();
+    let mut room_events = handle.subscribe();
+    let before_attach = room_events.sender_strong_count();
+    send(
+        &mut stalled,
+        &ClientMsg::JoinRoom {
+            code: room.code.clone(),
+            role: Role::Display,
+            name: Some("x".repeat(8 * 1024 * 1024)),
+            token: None,
+        },
+    )
+    .await;
+    // Do not read the echoed multi-megabyte Joined frame.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while room_events.sender_strong_count() <= before_attach {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("display did not attach");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(running.state.registry.remove(&room.code).await);
+    tokio::time::timeout(Duration::from_secs(1), handle.closed())
+        .await
+        .expect("room actor did not stop");
+    drop(handle);
+    drop(host_guard);
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Err(RecvError::Closed) = room_events.recv().await {
+                return;
+            }
+        }
+    })
+    .await;
+    drop(stalled);
+    assert!(
+        closed.is_ok(),
+        "removed room still has its initial-write connection"
+    );
+}

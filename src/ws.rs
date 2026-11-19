@@ -139,7 +139,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 // The room is no longer removed at its creation deadline.
                 live_socket.host_joined();
             }
-            let _ = send_one(&mut sink, &ServerMsg::Joined { role, name: name.clone() }).await;
+            let joined = ServerMsg::Joined {
+                role,
+                name: name.clone(),
+            };
+            tokio::select! {
+                // The first reply can stall before the outbound pump starts.
+                biased;
+                () = handle.closed() => {
+                    let _ = tokio::time::timeout(
+                        REMOVAL_WRITE_GRACE,
+                        send_one(&mut sink, &unknown_room(&code)),
+                    )
+                    .await;
+                    return;
+                }
+                result = send_one(&mut sink, &joined) => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
+            }
             (role, name)
         }
         Some(other @ ServerMsg::Error { .. }) => {

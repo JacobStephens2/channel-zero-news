@@ -139,7 +139,7 @@ message.
 cp .env.example .env          # set DATABASE_URL
 cargo test                    # unit + in-memory WS e2e
 set -a; . ./.env; set +a
-cargo test --test persistence # DB-backed persistence (skipped if no DATABASE_URL)
+cargo test --test persistence --test removal_during_persistence # DB-backed tests (skipped if no DATABASE_URL)
 cargo run                     # serves on 0.0.0.0:3471
 ```
 
