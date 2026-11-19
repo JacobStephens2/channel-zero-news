@@ -6,6 +6,7 @@
 //! suite stays hermetic. Run with:
 //!   set -a; . ./.env; set +a; cargo test --test persistence -- --nocapture
 
+use channel_zero::client_address::ClientAddress;
 use channel_zero::db::Db;
 use channel_zero::direct;
 use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
@@ -65,7 +66,7 @@ async fn final_responses_and_archive_persist_to_postgres() {
 
     let registry = Registry::new();
     let room = registry
-        .create_room(prompts, Some(db.clone()))
+        .create_room(ClientAddress::NO_PEER, prompts, Some(db.clone()))
         .await
         .expect("create room");
     let code = room.code.clone();

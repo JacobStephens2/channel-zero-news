@@ -10,6 +10,8 @@ use axum::{
     Json,
 };
 
+use crate::registry::CreateRoomError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("{0}")]
@@ -19,6 +21,9 @@ pub enum AppError {
     /// Creation could not retain a room (live-room cap or join-code attempts).
     #[error("{0}")]
     Unavailable(String),
+    /// The creating client address already has its quota of live rooms.
+    #[error("{0}")]
+    TooManyRooms(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -29,7 +34,19 @@ impl AppError {
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             AppError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+            AppError::TooManyRooms(_) => (StatusCode::TOO_MANY_REQUESTS, "too_many_rooms"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        }
+    }
+}
+
+impl From<CreateRoomError> for AppError {
+    fn from(err: CreateRoomError) -> Self {
+        match err {
+            CreateRoomError::AtQuota => AppError::TooManyRooms(err.to_string()),
+            CreateRoomError::AtCapacity | CreateRoomError::NoJoinCode => {
+                AppError::Unavailable(err.to_string())
+            }
         }
     }
 }
