@@ -9,6 +9,7 @@ use axum::{
 use serde::Serialize;
 
 use crate::app::AppState;
+use crate::client_address::ClientAddress;
 use crate::error::AppError;
 use crate::state::PromptSet;
 
@@ -24,8 +25,10 @@ pub struct CreateRoomResponse {
 }
 
 /// Create a room seeded with the current prompt catalog and start its actor.
+/// The room counts against `client`'s quota of live rooms.
 pub async fn create_room(
     State(state): State<AppState>,
+    client: ClientAddress,
 ) -> Result<Json<CreateRoomResponse>, AppError> {
     let prompts = state.prompt_catalog().await?;
     if prompts.is_empty() {
@@ -35,9 +38,8 @@ pub async fn create_room(
     }
     let room = state
         .registry
-        .create_room(prompts, state.db.clone())
-        .await
-        .map_err(|err| AppError::Unavailable(err.to_string()))?;
+        .create_room(client, prompts, state.db.clone())
+        .await?;
     Ok(Json(CreateRoomResponse {
         code: room.code,
         host_token: room.host_token,

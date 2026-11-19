@@ -3,14 +3,18 @@
 //! framed events and a server-event sink; the actor owns game state.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use futures_util::{FutureExt, Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::{broadcast, mpsc::error::TryRecvError};
 
 use crate::direct::{self, DirectReceiver, DirectSender};
 use crate::protocol::{ClientMsg, ErrorCode, Role, ServerMsg};
 use crate::registry::Registry;
 use crate::room::{Command, Delivery, RoomHandle};
+
+/// Bound the final removal error even when an earlier socket write is stalled.
+const REMOVAL_WRITE_GRACE: Duration = Duration::from_secs(1);
 
 /// Transport-neutral frame classification. Stream end or an error ends input;
 /// non-text frames end initial admission and are ignored after admission.
@@ -57,7 +61,7 @@ where
     let ClientMsg::JoinRoom { code, .. } = &join else {
         unreachable!()
     };
-    let Some((handle, _socket)) = registry.open_socket(code).await else {
+    let Some((handle, socket)) = registry.open_socket(code).await else {
         let _ = outgoing
             .send(error(
                 ErrorCode::UnknownRoom,
@@ -68,56 +72,73 @@ where
     };
     let (direct_tx, mut direct_rx) = direct::channel();
     let overflowed = direct_rx.overflowed();
-    let session = async {
-        // The actor reads initial identity from JoinRoom, never these dispatch
-        // fields. Only its successful acknowledgement establishes authority.
-        if handle
-            .dispatch(Command {
-                intent: join,
-                role: Role::Display,
-                name: None,
-                direct: direct_tx.clone(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let Some(first) = direct_rx.recv().await else {
-            return;
-        };
-        let identity = match &first.message {
-            ServerMsg::Joined { role, name } => Identity {
-                code: handle.code.clone(),
-                role: *role,
-                name: name.clone(),
-            },
-            ServerMsg::Error { .. } => {
-                let _ = outgoing.send(first.message).await;
+    let removed = {
+        let session = async {
+            // The actor reads initial identity from JoinRoom, never these dispatch
+            // fields. Only its successful acknowledgement establishes authority.
+            if handle
+                .dispatch(Command {
+                    intent: join,
+                    role: Role::Display,
+                    name: None,
+                    direct: direct_tx.clone(),
+                })
+                .await
+                .is_err()
+            {
                 return;
             }
-            _ => return,
+            let Some(first) = direct_rx.recv().await else {
+                return;
+            };
+            let identity = match &first.message {
+                ServerMsg::Joined { role, name } => Identity {
+                    code: handle.code.clone(),
+                    role: *role,
+                    name: name.clone(),
+                },
+                ServerMsg::Error { .. } => {
+                    let _ = outgoing.send(first.message).await;
+                    return;
+                }
+                _ => return,
+            };
+            let Some(events) = first.snapshot_start else {
+                return;
+            };
+            if identity.role.is_host() {
+                socket.host_joined();
+            }
+            // Preserve handshake backpressure: do not read later input before the
+            // first acknowledgement has been written.
+            if outgoing.send(first.message).await.is_err() {
+                return;
+            }
+            tokio::select! {
+                biased;
+                () = forward_input(&mut incoming, &handle, &identity, direct_tx) => {},
+                () = deliver(direct_rx, events, &mut outgoing) => {},
+            }
         };
-        let Some(events) = first.snapshot_start else {
-            return;
-        };
-        // Preserve handshake backpressure: do not read later input before the
-        // first acknowledgement has been written.
-        if outgoing.send(first.message).await.is_err() {
-            return;
-        }
         tokio::select! {
+            // Sticky overflow wins even when another terminal event is ready.
             biased;
-            () = forward_input(&mut incoming, &handle, &identity, direct_tx) => {},
-            () = deliver(direct_rx, events, &mut outgoing) => {},
+            () = overflowed => false,
+            () = handle.closed() => true,
+            () = session => handle.closed().now_or_never().is_some(),
         }
     };
-    tokio::select! {
-        // Sticky overflow wins even when another terminal event is ready.
-        biased;
-        () = overflowed => {},
-        () = handle.closed() => {},
-        () = session => {},
+    if removed {
+        // The session future is dropped before borrowing the sink again.
+        // Removal is terminal: no queued snapshot or broadcast follows this.
+        let _ = tokio::time::timeout(
+            REMOVAL_WRITE_GRACE,
+            outgoing.send(error(
+                ErrorCode::UnknownRoom,
+                format!("no room with code {}", handle.code),
+            )),
+        )
+        .await;
     }
 }
 
@@ -240,7 +261,10 @@ mod tests {
     #[tokio::test]
     async fn actor_termination_cancels_a_blocked_write_and_releases_the_guard() {
         let registry = Registry::new();
-        let room = registry.create_room(vec![], None).await.unwrap();
+        let room = registry
+            .create_room(crate::client_address::ClientAddress::NO_PEER, vec![], None)
+            .await
+            .unwrap();
         let actor = registry.get(&room.code).await.unwrap().actor;
         let incoming = stream::once(async {
             Ok::<_, ()>(Incoming::Intent(ClientMsg::JoinRoom {

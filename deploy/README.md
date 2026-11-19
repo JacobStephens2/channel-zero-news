@@ -23,6 +23,24 @@ systemd service on `127.0.0.1:3471`.
   are the primary vhosts. Certbot manages TLS under
   `/etc/letsencrypt/live/channelzeronews.app/`.
 
+## Room quota keys on the address Apache appends
+
+`POST /api/rooms` allows 8 live rooms per client address, and the client
+address is the entry the local Apache appends to `X-Forwarded-For`. mod_proxy
+adds that header because `ProxyAddHeaders` defaults to On and none of these
+vhosts turn it off, so the Apache config needs no change. The service reads
+the header only from a loopback peer, takes its rightmost entry, and ignores
+any entries the client sent in front of it.
+
+* Keep `CHANNEL_ZERO_ADDR` on `127.0.0.1` behind Apache. A request from any
+  other peer counts against that peer's own address, forwarded headers ignored.
+* Keep `ProxyAddHeaders` on. With it Off, Apache stops appending but still
+  forwards any `X-Forwarded-For` the client sent, so the rightmost entry is the
+  client's own choice: a client could name a new address on every create and
+  skip the quota. Clients that send no header would share 127.0.0.1's quota.
+* Another proxy in front of Apache would key every create on that proxy's
+  address, so all clients behind it would share one 8-room quota.
+
 ## Apply / update
 
 ```bash

@@ -1,11 +1,13 @@
-//! Shared application state and router construction.
+//! Shared application state, router construction, and serving.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
     routing::{get, post},
     Router,
 };
+use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -80,4 +82,15 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Serve `app` on `listener` with each connection's peer address, which
+/// [`ClientAddress`](crate::client_address::ClientAddress) needs to tell
+/// clients apart. Served without it, every create counts against one quota.
+pub async fn serve(listener: TcpListener, app: Router) -> std::io::Result<()> {
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }

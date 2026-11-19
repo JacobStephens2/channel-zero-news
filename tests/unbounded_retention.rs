@@ -1,22 +1,31 @@
-//! Live-room retention: a cap, and removal when no socket is attached.
+//! Live-room retention: a cap, a quota per client address, removal of a room
+//! whose host never joins, and removal when no socket is attached.
 //!
 //! The no-socket case is the security reproduction for anonymous
 //! `POST /api/rooms`: three empty creates, no WebSocket, one second later the
 //! registry count is 0. The HTTP body does not carry the count.
+//!
+//! The quota tests serve the router as the binary does, with peer addresses,
+//! and send what the local Apache forwards. The others serve it without peer
+//! addresses, so all their creates share one quota.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
-use channel_zero::app::{build_router, AppState};
-use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
-use channel_zero::registry::MAX_LIVE_ROOMS;
+use channel_zero::app::{self, build_router, AppState};
+use channel_zero::client_address::ClientAddress;
+use channel_zero::protocol::{ClientMsg, ErrorCode, Role, ServerMsg};
+use channel_zero::registry::{IDLE_WITHOUT_SOCKET, MAX_LIVE_ROOMS};
 use channel_zero::state::PromptSet;
-use futures_util::SinkExt;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use futures_util::StreamExt;
+use tokio::net::TcpListener;
+use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::Message;
 
 #[path = "common/mod.rs"]
 mod common;
 
-use common::recv_until;
+use common::{create_room, http, join, recv_until, send, Ws};
 
 fn prompt_sets() -> Vec<PromptSet> {
     vec![PromptSet {
@@ -32,15 +41,36 @@ struct Running {
     state: AppState,
 }
 
-async fn spawn_server() -> Running {
+enum Peers {
+    /// Plain `axum::serve`: requests carry no peer address.
+    Unknown,
+    /// [`app::serve`], as the binary serves.
+    Known,
+}
+
+async fn spawn_server(peers: Peers) -> Running {
     let state = AppState::in_memory(prompt_sets());
-    let app = build_router(state.clone(), "static");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
+    Running {
+        addr: serve(listener, state.clone(), peers).await,
+        state,
+    }
+}
+
+/// Serve the router over `state` on `listener` once it answers `/health`, and
+/// return its address.
+async fn serve(listener: TcpListener, state: AppState, peers: Peers) -> String {
+    let router = build_router(state, "static");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve");
+        match peers {
+            // No Nagle delay, so request-reply loops stay well inside deadlines.
+            Peers::Unknown => axum::serve(listener, router).tcp_nodelay(true).await,
+            Peers::Known => app::serve(listener, router).await,
+        }
+        .expect("serve");
     });
 
     let http = http();
@@ -56,23 +86,64 @@ async fn spawn_server() -> Running {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    addr.to_string()
+}
 
-    Running {
-        addr: addr.to_string(),
-        state,
+fn host_join(code: &str, host_token: &str) -> ClientMsg {
+    ClientMsg::JoinRoom {
+        code: code.to_string(),
+        role: Role::Host,
+        name: None,
+        token: Some(host_token.to_string()),
     }
 }
 
-fn http() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("client")
+fn display_join(code: &str) -> ClientMsg {
+    ClientMsg::JoinRoom {
+        code: code.to_string(),
+        role: Role::Display,
+        name: None,
+        token: None,
+    }
+}
+
+/// The server has closed `ws`: the next read ends the stream instead of
+/// returning a frame.
+async fn assert_closed(ws: &mut Ws) {
+    let next = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("the socket was still open");
+    assert!(
+        matches!(next, None | Some(Err(_)) | Some(Ok(Message::Close(_)))),
+        "expected the socket to close, got {next:?}"
+    );
+}
+
+/// `POST /api/rooms` carrying `forwarded_for` as its `X-Forwarded-For`. Bytes,
+/// because Apache forwards a client's own header bytes unchanged.
+async fn create_from(
+    http: &reqwest::Client,
+    url: &str,
+    forwarded_for: &[u8],
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let shown = forwarded_for.escape_ascii();
+    let response = http
+        .post(url)
+        .header("x-forwarded-for", forwarded_for)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("create from {shown} failed: {e}"));
+    let status = response.status();
+    let body = response
+        .json()
+        .await
+        .unwrap_or_else(|e| panic!("create from {shown} body: {e}"));
+    (status, body)
 }
 
 #[tokio::test]
 async fn three_empty_posts_are_reaped_without_a_websocket() {
-    let running = spawn_server().await;
+    let running = spawn_server(Peers::Unknown).await;
     let http = http();
 
     for n in 1..=3 {
@@ -109,42 +180,9 @@ async fn three_empty_posts_are_reaped_without_a_websocket() {
 
 #[tokio::test]
 async fn a_joined_socket_keeps_the_room_and_closing_it_lets_the_deadline_remove_it() {
-    let running = spawn_server().await;
-    let http = http();
-    let created: serde_json::Value = http
-        .post(format!("http://{}/api/rooms", running.addr))
-        .body("")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let code = created["code"].as_str().unwrap().to_string();
-    let host_token = created["host_token"].as_str().unwrap().to_string();
-
-    let (mut ws, _) = connect_async(format!("ws://{}/ws", running.addr))
-        .await
-        .unwrap();
-    let join = ClientMsg::JoinRoom {
-        code: code.clone(),
-        role: Role::Host,
-        name: None,
-        token: Some(host_token),
-    };
-    ws.send(Message::Text(serde_json::to_string(&join).unwrap()))
-        .await
-        .unwrap();
-    recv_until(&mut ws, |msg| {
-        matches!(
-            msg,
-            ServerMsg::Joined {
-                role: Role::Host,
-                ..
-            }
-        )
-    })
-    .await;
+    let running = spawn_server(Peers::Unknown).await;
+    let (code, host_token) = create_room(&running.addr).await;
+    let mut ws = join(&running.addr, &host_join(&code, &host_token)).await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(
@@ -152,11 +190,7 @@ async fn a_joined_socket_keeps_the_room_and_closing_it_lets_the_deadline_remove_
         1,
         "a joined socket should still be retained after the idle deadline"
     );
-    ws.send(Message::Text(
-        serde_json::to_string(&ClientMsg::Ping).unwrap(),
-    ))
-    .await
-    .unwrap();
+    send(&mut ws, &ClientMsg::Ping).await;
     recv_until(&mut ws, |msg| matches!(msg, ServerMsg::Pong)).await;
 
     ws.close(None).await.unwrap();
@@ -168,24 +202,74 @@ async fn a_joined_socket_keeps_the_room_and_closing_it_lets_the_deadline_remove_
 }
 
 #[tokio::test]
+async fn a_room_whose_host_never_joins_is_removed_at_its_creation_deadline_and_its_socket_closed() {
+    let running = spawn_server(Peers::Unknown).await;
+    let created_at = Instant::now();
+    let (code, _host_token) = create_room(&running.addr).await;
+    // A non-host join succeeds before the deadline but does not keep the room.
+    let mut display = join(&running.addr, &display_join(&code)).await;
+
+    let error = recv_until(&mut display, |msg| matches!(msg, ServerMsg::Error { .. })).await;
+    assert!(
+        matches!(
+            error,
+            ServerMsg::Error {
+                code: ErrorCode::UnknownRoom,
+                ..
+            }
+        ),
+        "expected unknown_room once the room was removed, got {error:?}"
+    );
+    assert!(
+        created_at.elapsed() >= IDLE_WITHOUT_SOCKET,
+        "the room was removed before its creation deadline"
+    );
+    assert_closed(&mut display).await;
+    assert!(running.state.registry.get(&code).await.is_none());
+}
+
+#[tokio::test]
+async fn a_hosted_room_stays_while_a_non_host_socket_remains_after_the_host_leaves() {
+    let running = spawn_server(Peers::Unknown).await;
+    let (code, host_token) = create_room(&running.addr).await;
+    let mut host = join(&running.addr, &host_join(&code, &host_token)).await;
+    let mut display = join(&running.addr, &display_join(&code)).await;
+
+    host.close(None).await.unwrap();
+    drop(host);
+    // Past the creation deadline, and past the idle deadline the host's close
+    // would have started had it been the last socket.
+    tokio::time::sleep(IDLE_WITHOUT_SOCKET + Duration::from_millis(300)).await;
+    assert!(
+        running.state.registry.get(&code).await.is_some(),
+        "the display's socket should keep a room whose host joined"
+    );
+    send(&mut display, &ClientMsg::Ping).await;
+    recv_until(&mut display, |msg| matches!(msg, ServerMsg::Pong)).await;
+}
+
+#[tokio::test]
 async fn create_past_the_cap_returns_unavailable_and_retains_nothing() {
-    let running = spawn_server().await;
+    let running = spawn_server(Peers::Unknown).await;
     let mut sockets = Vec::new();
-    for _ in 0..MAX_LIVE_ROOMS {
+    for n in 0..MAX_LIVE_ROOMS {
+        // One room per address, so no address reaches its own quota.
+        let creator = ClientAddress::key_for(IpAddr::from([10, 0, 0, u8::try_from(n).unwrap()]));
         let room = running
             .state
             .registry
-            .create_room(prompt_sets(), None)
+            .create_room(creator, prompt_sets(), None)
             .await
             .expect("room under the cap");
-        sockets.push(
-            running
-                .state
-                .registry
-                .open_socket(&room.code)
-                .await
-                .expect("socket under the cap"),
-        );
+        let (handle, socket) = running
+            .state
+            .registry
+            .open_socket(&room.code)
+            .await
+            .expect("socket under the cap");
+        // As the connection handler does once a host join is acknowledged.
+        socket.host_joined();
+        sockets.push((handle, socket));
     }
     assert_eq!(running.state.registry.count().await, MAX_LIVE_ROOMS);
 
@@ -204,5 +288,86 @@ async fn create_past_the_cap_returns_unavailable_and_retains_nothing() {
         "rejected create still returned a code: {body}"
     );
     assert_eq!(running.state.registry.count().await, MAX_LIVE_ROOMS);
+    drop(sockets);
+}
+
+#[tokio::test]
+async fn one_forwarded_address_creates_eight_rooms_then_gets_429_while_another_still_creates() {
+    let running = spawn_server(Peers::Known).await;
+    let http = http();
+    let url = format!("http://{}/api/rooms", running.addr);
+    let mut sockets = Vec::new();
+    for n in 1..=8 {
+        // The client's own leading entry changes; the one Apache appends does not.
+        let forwarded_for = format!("198.51.100.{n}, 203.0.113.7");
+        let (status, body) = create_from(&http, &url, forwarded_for.as_bytes()).await;
+        assert!(
+            status.is_success(),
+            "create {n} status {status} body {body}"
+        );
+        let code = body["code"].as_str().expect("created code");
+        let token = body["host_token"].as_str().expect("host token");
+        sockets.push(join(&running.addr, &host_join(code, token)).await);
+    }
+
+    let (status, body) = create_from(&http, &url, b"198.51.100.9, 203.0.113.7").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "body {body}"
+    );
+    assert_eq!(body["error"], "too_many_rooms");
+    assert!(
+        body.get("code").is_none(),
+        "rejected create returned a code: {body}"
+    );
+    assert_eq!(running.state.registry.count().await, 8);
+
+    let (status, body) = create_from(&http, &url, b"203.0.113.8").await;
+    assert!(
+        status.is_success(),
+        "other address status {status} body {body}"
+    );
+    assert!(
+        body.get("code").is_some(),
+        "other address missing code: {body}"
+    );
+    drop(sockets);
+}
+
+#[tokio::test]
+async fn bytes_a_client_sends_before_the_entry_apache_appends_do_not_lift_its_quota() {
+    let running = spawn_server(Peers::Known).await;
+    let http = http();
+    let url = format!("http://{}/api/rooms", running.addr);
+    let mut sockets = Vec::new();
+    for n in 1..=8 {
+        let (status, body) = create_from(&http, &url, b"203.0.113.7").await;
+        assert!(
+            status.is_success(),
+            "create {n} status {status} body {body}"
+        );
+        let code = body["code"].as_str().expect("created code");
+        let token = body["host_token"].as_str().expect("host token");
+        sockets.push(join(&running.addr, &host_join(code, token)).await);
+    }
+
+    // Apache forwards the client's own header bytes unchanged, non-ASCII
+    // included, and appends `, 203.0.113.7` after them on the same line.
+    let lines: [&[u8]; 3] = [
+        b"198.51.100.9, 203.0.113.7",
+        b"\xff, 203.0.113.7",
+        "é, 203.0.113.7".as_bytes(),
+    ];
+    for forwarded_for in lines {
+        let (status, body) = create_from(&http, &url, forwarded_for).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "{} body {body}",
+            forwarded_for.escape_ascii()
+        );
+    }
+    assert_eq!(running.state.registry.count().await, 8);
     drop(sockets);
 }

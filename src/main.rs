@@ -6,7 +6,7 @@
 
 use std::net::SocketAddr;
 
-use channel_zero::app::{build_router, AppState};
+use channel_zero::app::{build_router, serve, AppState};
 use channel_zero::db::Db;
 use channel_zero::state::PromptSet;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -47,12 +47,14 @@ async fn main() {
 
     tracing::info!("channel-zero listening on http://{addr}");
 
-    axum::serve(listener, app).await.expect("server crashed");
+    serve(listener, app).await.expect("server crashed");
 }
 
 fn init_tracing() {
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,channel_zero=debug".into()))
+        .with(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,channel_zero=debug".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 }

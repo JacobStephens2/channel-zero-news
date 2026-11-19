@@ -4,8 +4,9 @@
 //! persistence layers can be unit-tested independently of the Axum binary.
 
 pub mod app;
-pub mod db;
+pub mod client_address;
 pub mod connection;
+pub mod db;
 mod direct;
 pub mod error;
 pub mod protocol;

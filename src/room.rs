@@ -14,9 +14,16 @@
 //!   [direct reply channel](crate::direct). The actor never waits on that
 //!   channel: one that overflows closes its connection instead.
 //!
+//! The registry stops the actor on removal, including pending durable effects.
+//! Accepted intents that broadcast state changes refresh the activity deadline.
+//!
 //! Rules and projection belong to [`RoomGame`]; the actor sees only its reactions.
 
-use tokio::sync::{broadcast, mpsc};
+use std::future::Future;
+use std::time::Duration;
+
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::time::Instant;
 
 use crate::db::Db;
 use crate::direct::DirectSender;
@@ -63,8 +70,8 @@ impl Delivery {
 pub struct RoomHandle {
     pub(crate) code: String,
     cmd_tx: mpsc::Sender<Command>,
-    #[cfg(test)]
-    events_tx: broadcast::Sender<ServerMsg>,
+    /// The actor owns the only sender, so activity closes when it stops.
+    last_activity: watch::Receiver<Instant>,
     #[cfg(test)]
     pub(crate) actor: tokio::task::AbortHandle,
 }
@@ -74,45 +81,75 @@ pub struct RoomHandle {
 pub struct RoomClosed;
 
 impl RoomHandle {
-    /// Subscribe to this room's broadcast event stream.
-    #[cfg(test)]
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ServerMsg> {
-        self.events_tx.subscribe()
-    }
-
     /// Queue a command for the actor.
     pub(crate) async fn dispatch(&self, cmd: Command) -> Result<(), RoomClosed> {
         self.cmd_tx.send(cmd).await.map_err(|_| RoomClosed)
     }
 
-    pub(crate) async fn closed(&self) {
+    /// Resolves once the actor has stopped, including on registry removal.
+    pub async fn closed(&self) {
         self.cmd_tx.closed().await;
+    }
+
+    /// Wait for `limit` without accepted, broadcast state changes. The wait
+    /// ends with `RoomClosed` when the actor stops and does not borrow the handle.
+    pub fn inactive_for(
+        &self,
+        limit: Duration,
+    ) -> impl Future<Output = Result<(), RoomClosed>> + Send + 'static {
+        let mut last_activity = self.last_activity.clone();
+        async move {
+            loop {
+                let deadline = *last_activity.borrow_and_update() + limit;
+                tokio::select! {
+                    // Activity at the deadline still counts.
+                    biased;
+                    changed = last_activity.changed() => {
+                        if changed.is_err() {
+                            return Err(RoomClosed);
+                        }
+                    }
+                    () = tokio::time::sleep_until(deadline) => return Ok(()),
+                }
+            }
+        }
     }
 }
 
 /// Spawn a room actor and return a handle to it. `db` is `None` in tests and
 /// no-database runs, in which case durable effects are simply skipped.
+/// Resolving `stop` ends the actor and drops queued commands and pending effects.
 pub(crate) fn spawn_room(
     code: impl Into<String>,
     prompt_sets: Vec<PromptSet>,
     host_token: impl Into<String>,
     db: Option<Db>,
+    stop: impl Future<Output = ()> + Send + 'static,
 ) -> RoomHandle {
     let code = code.into();
     let host_token = host_token.into();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
     let (events_tx, _events_rx) = broadcast::channel(BROADCAST_BUFFER);
 
+    let (activity_tx, last_activity) = watch::channel(Instant::now());
+
     let game = RoomGame::new(code.clone(), prompt_sets, host_token);
-    let _task = tokio::spawn(run(game, code.clone(), cmd_rx, events_tx.clone(), db));
+    let _task = tokio::spawn(run(
+        game,
+        code.clone(),
+        cmd_rx,
+        events_tx.clone(),
+        activity_tx,
+        db,
+        stop,
+    ));
 
     RoomHandle {
         code,
         cmd_tx,
         #[cfg(test)]
-        events_tx,
-        #[cfg(test)]
         actor: _task.abort_handle(),
+        last_activity,
     }
 }
 
@@ -122,10 +159,24 @@ async fn run(
     code: String,
     mut cmd_rx: mpsc::Receiver<Command>,
     events_tx: broadcast::Sender<ServerMsg>,
+    activity_tx: watch::Sender<Instant>,
     db: Option<Db>,
+    stop: impl Future<Output = ()>,
 ) {
-    while let Some(cmd) = cmd_rx.recv().await {
+    tokio::pin!(stop);
+    'commands: loop {
+        let next = tokio::select! {
+            // A stopped room takes no further command, even one already queued.
+            biased;
+            () = &mut stop => None,
+            cmd = cmd_rx.recv() => cmd,
+        };
+        let Some(cmd) = next else { break };
         let reaction = game.apply(cmd.role, cmd.name.as_deref(), cmd.intent);
+        // Pings, plain joins and rejected intents only reply to their sender.
+        if !reaction.broadcasts.is_empty() {
+            activity_tx.send_replace(Instant::now());
+        }
         for msg in reaction.broadcasts {
             // Errs only when there are zero subscribers — fine to ignore.
             let _ = events_tx.send(msg);
@@ -145,7 +196,12 @@ async fn run(
             });
         }
         for effect in reaction.effects {
-            run_effect(&db, &code, effect).await;
+            // A stalled write cannot keep a removed actor or its sockets alive.
+            tokio::select! {
+                biased;
+                () = &mut stop => break 'commands,
+                () = run_effect(&db, &code, effect) => {}
+            }
         }
     }
     tracing::debug!(room = %code, "room actor stopped");
@@ -165,5 +221,25 @@ async fn run_effect(db: &Option<Db>, code: &str, effect: Effect) {
             Ok(batch) => tracing::info!(room = %code, batch = %batch, "archived round"),
             Err(e) => tracing::error!(room = %code, error = %e, "failed to archive round"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registry's activity wait must end when removal stops the actor.
+    #[tokio::test(start_paused = true)]
+    async fn inactive_for_resolves_with_room_closed_once_the_actor_stops() {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let handle = spawn_room("ABCD", vec![], "tok", None, async move {
+            let _ = stopped.await;
+        });
+        let inactive = handle.inactive_for(Duration::from_secs(2 * 60 * 60));
+        drop(stop);
+        let ended = tokio::time::timeout(Duration::from_secs(5), inactive)
+            .await
+            .expect("the wait outlived the room's actor");
+        assert!(matches!(ended, Err(RoomClosed)));
     }
 }

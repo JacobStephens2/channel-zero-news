@@ -4,6 +4,7 @@
 use std::{sync::Arc, time::Duration};
 
 use channel_zero::{
+    client_address::ClientAddress,
     connection::Incoming,
     protocol::{ClientMsg, ErrorCode, Role, ServerMsg},
     registry::{NewRoom, Registry, IDLE_WITHOUT_SOCKET},
@@ -18,6 +19,7 @@ async fn room() -> (Arc<Registry>, NewRoom) {
     let registry = Registry::new();
     let room = registry
         .create_room(
+            ClientAddress::NO_PEER,
             vec![PromptSet {
                 id: 1,
                 name: "News".into(),
@@ -572,6 +574,7 @@ async fn concurrent_parser_errors_do_not_end_replay_prefixes() {
 async fn cancellation_during_admission_or_after_join_releases_guard() {
     for admitted in [false, true] {
         let (registry, room) = room().await;
+        let host = Connection::admit(&registry, join(&room, Role::Host, None)).await;
         let mut connection = if admitted {
             Connection::admit(&registry, join(&room, Role::Display, None)).await
         } else {
@@ -590,6 +593,64 @@ async fn cancellation_during_admission_or_after_join_releases_guard() {
             .await
             .unwrap_err()
             .is_cancelled());
+        drop(host);
         removed(&registry, &room.code).await;
+    }
+}
+
+#[tokio::test]
+async fn removal_cancels_blocked_output_during_admission_and_after_join() {
+    for admitted in [false, true] {
+        let (registry, room) = room().await;
+        let mut host = Connection::admit(&registry, join(&room, Role::Host, None)).await;
+        let mut connection = if admitted {
+            let mut connection =
+                Connection::admit(&registry, join(&room, Role::Display, None)).await;
+            connection.send(ClientMsg::Ping).await;
+            assert_eq!(connection.blocked().await, ServerMsg::Pong);
+            connection
+        } else {
+            let mut connection = Connection::start(&registry);
+            connection.send(join(&room, Role::Display, None)).await;
+            assert!(matches!(
+                connection.blocked().await,
+                ServerMsg::Joined { .. }
+            ));
+            connection
+        };
+        assert!(registry.remove(&room.code).await);
+        // A reading connection receives the terminal error; blocked output
+        // still ends without releasing its write permit.
+        assert_error(host.recv().await, ErrorCode::UnknownRoom);
+        host.ended().await;
+        connection.ended().await;
+        assert!(connection.input.as_ref().unwrap().is_closed());
+    }
+}
+
+#[tokio::test]
+async fn creation_deadline_cancels_blocked_output_during_admission_and_after_join() {
+    for admitted in [false, true] {
+        let (registry, room) = room().await;
+        let mut connection = if admitted {
+            let mut connection =
+                Connection::admit(&registry, join(&room, Role::Display, None)).await;
+            connection.send(ClientMsg::Ping).await;
+            assert_eq!(connection.blocked().await, ServerMsg::Pong);
+            connection
+        } else {
+            let mut connection = Connection::start(&registry);
+            connection.send(join(&room, Role::Display, None)).await;
+            assert!(matches!(
+                connection.blocked().await,
+                ServerMsg::Joined { .. }
+            ));
+            connection
+        };
+        // Display admission does not acknowledge the host. Let the creation
+        // deadline remove the room while its transport stays blocked.
+        connection.ended().await;
+        assert!(registry.get(&room.code).await.is_none());
+        assert!(connection.input.as_ref().unwrap().is_closed());
     }
 }

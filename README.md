@@ -26,21 +26,22 @@ host archives the round so the responses are retained but not reused.
 
 ```
 channel-zero/
-├── migrations/          SQLx migrations (prompt_sets, responses, response_archive)
+├── migrations/            SQLx migrations (prompt_sets, responses, response_archive)
 └── src/
-    ├── main.rs          binary: wire DB + router, serve
-    ├── app.rs           AppState + router construction
-    ├── routes.rs        REST: create/join room, prompt sets
-    ├── ws.rs            WebSocket upgrade + frame/JSON conversion
-    ├── connection.rs    Room connection admission, identity, delivery + termination
-    ├── room.rs          per-room actor: command queue, delivery + effect execution
-    ├── room_game.rs     opaque, pure Room game: intents → ordered reactions
-    ├── direct.rs        per-connection direct reply channel (fixed capacity)
-    ├── registry.rs      in-memory map of live rooms by join code
-    ├── state.rs         shared game value types + limits
-    ├── protocol.rs      serde message enums (client intents ↔ server events)
-    ├── db.rs            SQLx persistence
-    └── error.rs         typed error → HTTP/WS responses
+    ├── main.rs            binary: wire DB + router, serve
+    ├── app.rs             AppState + router construction + serving with peer addresses
+    ├── routes.rs          REST: create/join room, prompt sets
+    ├── client_address.rs  the client address a room create counts against
+    ├── ws.rs              WebSocket upgrade + frame/JSON conversion
+    ├── connection.rs      Room connection admission, identity, delivery + termination
+    ├── room.rs            per-room actor: command queue, delivery + effect execution
+    ├── room_game.rs       opaque, pure Room game: intents → ordered reactions
+    ├── direct.rs          per-connection direct reply channel (fixed capacity)
+    ├── registry.rs        in-memory map of live rooms by join code
+    ├── state.rs           shared game value types + limits
+    ├── protocol.rs        serde message enums (client intents ↔ server events)
+    ├── db.rs              SQLx persistence
+    └── error.rs           typed error → HTTP/WS responses
 ```
 
 ### Concurrency model (the centerpiece)
@@ -94,8 +95,10 @@ direct traffic can delay that connection's broadcasts.
 Scoped input/output futures run under overflow and actor-closure supervision.
 Any terminal event cancels sibling work, including pending writes, and drops
 the guard; cancelling the runner does the same. No detached forwarding task
-keeps a socket alive. Creation limits and the 500 ms no-socket retention policy
-are unchanged. Room session, Player round participation and Performance stage
+keeps a socket alive. The runner reports acknowledged host joins to the
+registry. Removal cancels pending writes, attempts a final `unknown_room`
+within the one-second write grace, and releases the socket guard. Room session,
+Player round participation and Performance stage
 remain tab-side owners with their current interfaces.
 
 ### Roles & authority
@@ -126,16 +129,43 @@ intents, so a player can disconnect mid-submission and reconnect to resubmit.
 Database writes are best-effort side effects — a DB failure is logged and never
 breaks the in-memory game.
 
+### Room retention
+
+Rooms live only in memory, so the registry (`src/registry.rs`) removes each
+one at the first of three deadlines:
+
+* **Host join:** a room whose host join is not acknowledged within 500 ms of
+  creation (`IDLE_WITHOUT_SOCKET`) is removed, even with display or player
+  sockets attached.
+* **No socket:** once its host has joined, any socket keeps the room; it is
+  removed 500 ms after the last one closes.
+* **Activity:** a room with no room activity for 2 hours
+  (`IDLE_WITHOUT_ACTIVITY`), counted from creation or its last activity, is
+  removed even with sockets attached. Room activity is an intent the room
+  accepts and broadcasts as a state change; pings, joins that add no player
+  and rejected intents don't count.
+
+Removal stops the room's actor. Every socket still attached gets
+`unknown_room` as its last frame and is closed, and the client clears its
+recovery record. Creation retains at most 128 live rooms (`MAX_LIVE_ROOMS`)
+and answers 503 past that.
+
 ## REST surface
 
-| Method | Path                 | Purpose                                   |
-|--------|----------------------|-------------------------------------------|
-| GET    | `/health`            | liveness                                  |
-| POST   | `/api/rooms`         | create a room → `{ code, host_token }`    |
-| GET    | `/api/rooms/:code`   | join validation → `{ exists }`            |
-| GET    | `/api/prompt-sets`   | the prompt-set catalog                    |
-| GET    | `/ws`                | the realtime game socket                  |
-| `/`    | (static)             | the test client                           |
+| Method | Path                 | Purpose                                                                                               |
+|--------|----------------------|-------------------------------------------------------------------------------------------------------|
+| GET    | `/health`            | liveness                                                                                              |
+| POST   | `/api/rooms`         | create a room → `{ code, host_token }`; 429 `too_many_rooms` when the client address has 8 live rooms |
+| GET    | `/api/rooms/:code`   | join validation → `{ exists }`                                                                        |
+| GET    | `/api/prompt-sets`   | the prompt-set catalog                                                                                |
+| GET    | `/ws`                | the realtime game socket                                                                              |
+| `/`    | (static)             | the test client                                                                                       |
+
+The client address is the rightmost `X-Forwarded-For` entry when the request
+comes from loopback (the local Apache appends it) and the TCP peer otherwise,
+with IPv6 counted by its /64. The address can create again once one of its
+rooms is removed. The 128-room cap across all addresses still answers 503
+`unavailable`.
 
 ## Protocol
 
@@ -153,7 +183,7 @@ message.
 cp .env.example .env          # set DATABASE_URL
 cargo test                    # unit + in-memory WS e2e
 set -a; . ./.env; set +a
-cargo test --test persistence # DB-backed persistence (skipped if no DATABASE_URL)
+cargo test --test persistence --test removal_during_persistence # DB-backed tests (skipped if no DATABASE_URL)
 cargo run                     # serves on 0.0.0.0:3471
 ```
 
@@ -209,6 +239,9 @@ ordered/routed events, full slide content/navigation and owned effect snapshots.
 Run them with `cargo test --locked --test room_game`. The focused direct-channel
 overflow test remains independent. `tests/full_flow.rs`
 retains real WebSocket framing, all-role, replay and overflow regressions.
+Blocked initial acknowledgements and later writes are checked through gated
+Room connections without resuming their output, for both explicit removal and
+the host-join creation deadline.
 
 `static/player-round-participation.mjs` owns Player round participation. The entry
 constructs it once with the document and a sender that delegates to Room session,
