@@ -10,7 +10,7 @@ use std::time::Duration;
 use channel_zero::app::{build_router, AppState};
 use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
 use channel_zero::state::{Phase, PromptSet, Slide, MAX_PLAYER_NAME_CHARS, MAX_ROSTER_PLAYERS};
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -102,9 +102,10 @@ async fn full_game_over_websocket() {
         send(&mut host, &ClientMsg::AddPlayer { name: name.into() }).await;
     }
     // wait until both players are visible
-    recv_until(&mut host, |m| {
-        matches!(m, ServerMsg::RoomState { room } if room.players.len() == 2)
-    })
+    recv_until(
+        &mut host,
+        |m| matches!(m, ServerMsg::RoomState { room } if room.players.len() == 2),
+    )
     .await;
 
     // ---- display screen joins (read-only) ----
@@ -128,9 +129,10 @@ async fn full_game_over_websocket() {
 
     // ---- host opens submissions ----
     send(&mut host, &ClientMsg::StartCollecting).await;
-    recv_until(&mut host, |m| {
-        matches!(m, ServerMsg::RoomState { room } if room.phase == Phase::Collecting)
-    })
+    recv_until(
+        &mut host,
+        |m| matches!(m, ServerMsg::RoomState { room } if room.phase == Phase::Collecting),
+    )
     .await;
 
     // ---- players join and submit ----
@@ -164,7 +166,10 @@ async fn full_game_over_websocket() {
         .await;
         // confirm the server accepted it (no error before progress)
         recv_until(&mut player, |m| {
-            matches!(m, ServerMsg::SubmissionProgress { .. } | ServerMsg::RoomState { .. })
+            matches!(
+                m,
+                ServerMsg::SubmissionProgress { .. } | ServerMsg::RoomState { .. }
+            )
         })
         .await;
     }
@@ -186,13 +191,17 @@ async fn full_game_over_websocket() {
     assert_eq!(total_slides, 1 + 2 * 6 + 2);
 
     // the display should see the first slide (the rules)
-    let slide0 = recv_until(&mut display, |m| {
-        matches!(m, ServerMsg::SlideChanged { index, .. } if *index == 0)
-    })
+    let slide0 = recv_until(
+        &mut display,
+        |m| matches!(m, ServerMsg::SlideChanged { index, .. } if *index == 0),
+    )
     .await;
     assert!(matches!(
         slide0,
-        ServerMsg::SlideChanged { slide: Slide::Rules, .. }
+        ServerMsg::SlideChanged {
+            slide: Slide::Rules,
+            ..
+        }
     ));
 
     // ---- host advances the carousel; display follows ----
@@ -204,9 +213,10 @@ async fn full_game_over_websocket() {
 
     // ---- host archives the round ----
     send(&mut host, &ClientMsg::ArchiveRound).await;
-    recv_until(&mut host, |m| {
-        matches!(m, ServerMsg::RoomState { room } if room.phase == Phase::Archived)
-    })
+    recv_until(
+        &mut host,
+        |m| matches!(m, ServerMsg::RoomState { room } if room.phase == Phase::Archived),
+    )
     .await;
 }
 
@@ -250,6 +260,132 @@ async fn joining_unknown_room_errors() {
     assert!(
         matches!(err, ServerMsg::Error { code, .. } if code == channel_zero::protocol::ErrorCode::UnknownRoom)
     );
+}
+
+#[tokio::test]
+async fn replay_cannot_change_the_acknowledged_identity() {
+    let addr = spawn_server().await;
+    let (code, _) = create_room(&addr).await;
+    let mut player = join(
+        &addr,
+        &ClientMsg::JoinRoom {
+            code: code.clone(),
+            role: Role::Player,
+            name: Some("Ann".into()),
+            token: None,
+        },
+    )
+    .await;
+    send(
+        &mut player,
+        &ClientMsg::JoinRoom {
+            code,
+            role: Role::Player,
+            name: Some("Bo".into()),
+            token: None,
+        },
+    )
+    .await;
+    let reply = recv_until(&mut player, |m| {
+        matches!(m, ServerMsg::Joined { .. } | ServerMsg::Error { .. })
+    })
+    .await;
+    assert!(
+        matches!(
+            reply,
+            ServerMsg::Error {
+                code: channel_zero::protocol::ErrorCode::Forbidden,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    send(&mut player, &ClientMsg::Ping).await;
+    recv_until(&mut player, |m| matches!(m, ServerMsg::Pong)).await;
+}
+
+#[tokio::test]
+async fn same_identity_assignment_replay_over_websocket() {
+    let addr = spawn_server().await;
+    let (code, token) = create_room(&addr).await;
+    let mut host = join(
+        &addr,
+        &ClientMsg::JoinRoom {
+            code: code.clone(),
+            role: Role::Host,
+            name: None,
+            token: Some(token),
+        },
+    )
+    .await;
+    let ann_join = ClientMsg::JoinRoom {
+        code: code.clone(),
+        role: Role::Player,
+        name: Some("Ann".into()),
+        token: None,
+    };
+    let mut ann = join(&addr, &ann_join).await;
+    let _bo = join(
+        &addr,
+        &ClientMsg::JoinRoom {
+            code,
+            role: Role::Player,
+            name: Some("Bo".into()),
+            token: None,
+        },
+    )
+    .await;
+    send(&mut host, &ClientMsg::StartCollecting).await;
+    recv_until(
+        &mut host,
+        |m| matches!(m, ServerMsg::RoomState { room } if room.phase == Phase::Collecting),
+    )
+    .await;
+    for _ in 0..2 {
+        send(&mut ann, &ann_join).await;
+        recv_until(&mut ann, |m| matches!(m, ServerMsg::Joined { .. })).await;
+        assert!(
+            matches!(recv_until(&mut ann, |_| true).await, ServerMsg::RoomState { room } if room.phase == Phase::Collecting)
+        );
+        assert!(matches!(
+            recv_until(&mut ann, |_| true).await,
+            ServerMsg::SubmissionProgress { total: 2, .. }
+        ));
+        assert!(
+            matches!(recv_until(&mut ann, |_| true).await, ServerMsg::Assignment { partner, prompts } if partner == "Bo" && prompts.len() == 3)
+        );
+    }
+}
+
+#[tokio::test]
+async fn first_frame_conversion_preserves_errors_and_termination() {
+    let addr = spawn_server().await;
+    for (frame, error) in [
+        (Message::Binary(vec![1]), None),
+        (
+            Message::Text("{".into()),
+            Some(channel_zero::protocol::ErrorCode::NotJoined),
+        ),
+        (
+            Message::Text(r#"{"type":"ping"}"#.into()),
+            Some(channel_zero::protocol::ErrorCode::NotJoined),
+        ),
+    ] {
+        let mut socket = connect(&addr).await;
+        socket.send(frame).await.unwrap();
+        if let Some(expected) = error {
+            assert!(
+                matches!(recv_until(&mut socket, |_| true).await, ServerMsg::Error { code, .. } if code == expected)
+            );
+        }
+        let last = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("rejected attempt stayed open");
+        assert!(
+            !matches!(last, Some(Ok(Message::Text(_)))),
+            "rejection sent extra JSON: {last:?}"
+        );
+    }
 }
 
 /// Unread rejoins sent before the test switches to pings. With a full roster

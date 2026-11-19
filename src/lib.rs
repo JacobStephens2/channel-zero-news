@@ -5,12 +5,14 @@
 
 pub mod app;
 pub mod client_address;
+pub mod connection;
 pub mod db;
-pub mod direct;
+mod direct;
 pub mod error;
 pub mod protocol;
 pub mod registry;
 pub mod room;
+pub mod room_game;
 pub mod routes;
 pub mod state;
 pub mod ws;

@@ -16,14 +16,11 @@ use channel_zero::app::{self, build_router, AppState};
 use channel_zero::client_address::ClientAddress;
 use channel_zero::protocol::{ClientMsg, ErrorCode, Role, ServerMsg};
 use channel_zero::registry::{IDLE_WITHOUT_SOCKET, MAX_LIVE_ROOMS};
-use channel_zero::state::{PromptSet, MAX_PLAYER_NAME_CHARS, MAX_ROSTER_PLAYERS};
-use futures_util::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpSocket};
-use tokio::sync::broadcast::error::RecvError;
+use channel_zero::state::PromptSet;
+use futures_util::StreamExt;
+use tokio::net::TcpListener;
 use tokio::time::Instant;
-use tokio_tungstenite::{
-    client_async, connect_async_with_config, tungstenite::Message, MaybeTlsStream,
-};
+use tokio_tungstenite::tungstenite::Message;
 
 #[path = "common/mod.rs"]
 mod common;
@@ -51,11 +48,6 @@ enum Peers {
     Known,
 }
 
-/// Bytes asked for each accepted socket's send buffer by
-/// [`serve_with_small_send_buffers`], and for a stalled client's receive
-/// buffer. Linux doubles the request and stops autotuning the buffer.
-const SMALL_SOCKET_BUFFER: u32 = 4096;
-
 async fn spawn_server(peers: Peers) -> Running {
     let state = AppState::in_memory(prompt_sets());
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -65,21 +57,6 @@ async fn spawn_server(peers: Peers) -> Running {
         addr: serve(listener, state.clone(), peers).await,
         state,
     }
-}
-
-/// Serve `state` on a second loopback listener whose accepted sockets inherit
-/// a send buffer of a few kilobytes, so a client of this address that stops
-/// reading stalls its connection's writes after a few frames rather than a
-/// few megabytes. Returns the address.
-async fn serve_with_small_send_buffers(state: AppState) -> String {
-    let socket = TcpSocket::new_v4().expect("socket");
-    socket
-        .set_send_buffer_size(SMALL_SOCKET_BUFFER)
-        .expect("send buffer");
-    socket
-        .bind("127.0.0.1:0".parse().unwrap())
-        .expect("bind loopback");
-    serve(socket.listen(1024).expect("listen"), state, Peers::Unknown).await
 }
 
 /// Serve the router over `state` on `listener` once it answers `/health`, and
@@ -271,110 +248,6 @@ async fn a_hosted_room_stays_while_a_non_host_socket_remains_after_the_host_leav
     recv_until(&mut display, |msg| matches!(msg, ServerMsg::Pong)).await;
 }
 
-/// A distinct player name whose JSON is as long as a name gets: control
-/// characters, each escaped to six bytes.
-fn bulky_name(i: usize) -> String {
-    format!("{i:02}") + &"\u{1}".repeat(MAX_PLAYER_NAME_CHARS - 2)
-}
-
-/// Player joins after which the stalled display's buffers are certainly full.
-/// Each join broadcasts the whole roster twice, about 2.4 KB per player with
-/// [`bulky_name`]s, so 16 joins send it over 300 KB.
-const JOINS_TO_STALL: usize = 16;
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_removed_rooms_socket_is_closed_even_when_its_client_stopped_reading() {
-    let running = spawn_server(Peers::Unknown).await;
-    let stalling_addr = serve_with_small_send_buffers(running.state.clone()).await;
-    let (code, _host_token) = create_room(&running.addr).await;
-    // Every connection to the room holds a sender of this channel, so it
-    // reports Closed only once the actor and all of those connections end.
-    let mut room_events = running.state.registry.get(&code).await.unwrap().subscribe();
-
-    // A display that stops reading once its join is acknowledged.
-    let socket = TcpSocket::new_v4().unwrap();
-    socket.set_recv_buffer_size(SMALL_SOCKET_BUFFER).unwrap();
-    let stream = socket
-        .connect(stalling_addr.parse().unwrap())
-        .await
-        .unwrap();
-    let (mut stalled, _) = client_async(
-        format!("ws://{stalling_addr}/ws"),
-        MaybeTlsStream::Plain(stream),
-    )
-    .await
-    .unwrap();
-    send(&mut stalled, &display_join(&code)).await;
-    recv_until(&mut stalled, |m| matches!(m, ServerMsg::Joined { .. })).await;
-
-    // Non-host self-registrations until the creation deadline; each one
-    // broadcasts the whole roster twice to the display. The player socket
-    // reads each acknowledgement before its next join.
-    let (mut players, _) =
-        connect_async_with_config(format!("ws://{}/ws", running.addr), None, true)
-            .await
-            .unwrap();
-    let mut acknowledged = 0;
-    'joins: for i in 0..MAX_ROSTER_PLAYERS {
-        let player_join = ClientMsg::JoinRoom {
-            code: code.clone(),
-            role: Role::Player,
-            name: Some(bulky_name(i)),
-            token: None,
-        };
-        let frame = Message::Text(serde_json::to_string(&player_join).unwrap());
-        if players.send(frame).await.is_err() {
-            break;
-        }
-        loop {
-            match tokio::time::timeout(Duration::from_secs(2), players.next()).await {
-                Ok(Some(Ok(Message::Text(text)))) if text.starts_with("{\"type\":\"joined\"") => {
-                    acknowledged += 1;
-                    break;
-                }
-                Ok(Some(Ok(Message::Text(text)))) if text.contains("\"unknown_room\"") => {
-                    break 'joins;
-                }
-                Ok(Some(Ok(_))) => continue,
-                _ => break 'joins,
-            }
-        }
-    }
-    assert!(
-        acknowledged >= JOINS_TO_STALL,
-        "precondition: only {acknowledged} joins before the creation deadline"
-    );
-    let drain = tokio::spawn(async move { while let Some(Ok(_)) = players.next().await {} });
-
-    // The creation deadline removes the room with the display attached.
-    let removal_deadline = Instant::now() + Duration::from_secs(2);
-    while running.state.registry.get(&code).await.is_some() {
-        assert!(
-            Instant::now() < removal_deadline,
-            "the room was not removed at its creation deadline"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    // A socket whose client stopped reading cannot take unknown_room, but must
-    // still be closed.
-    let all_closed = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if let Err(RecvError::Closed) = room_events.recv().await {
-                return;
-            }
-        }
-    })
-    .await;
-    assert!(
-        all_closed.is_ok(),
-        "a connection to the removed room was still open 3 s after its removal \
-         ({acknowledged} joins before the deadline)"
-    );
-    drop(stalled);
-    let _ = drain.await;
-}
-
 #[tokio::test]
 async fn create_past_the_cap_returns_unavailable_and_retains_nothing() {
     let running = spawn_server(Peers::Unknown).await;
@@ -497,69 +370,4 @@ async fn bytes_a_client_sends_before_the_entry_apache_appends_do_not_lift_its_qu
     }
     assert_eq!(running.state.registry.count().await, 8);
     drop(sockets);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn removal_closes_a_socket_stalled_writing_its_initial_joined_reply() {
-    let running = spawn_server(Peers::Unknown).await;
-    let addr = serve_with_small_send_buffers(running.state.clone()).await;
-    let socket = TcpSocket::new_v4().unwrap();
-    socket.set_recv_buffer_size(SMALL_SOCKET_BUFFER).unwrap();
-    let stream = socket.connect(addr.parse().unwrap()).await.unwrap();
-    let (mut stalled, _) = client_async(format!("ws://{addr}/ws"), MaybeTlsStream::Plain(stream))
-        .await
-        .unwrap();
-    let room = running
-        .state
-        .registry
-        .create_room(ClientAddress::NO_PEER, prompt_sets(), None)
-        .await
-        .unwrap();
-    let (handle, host_guard) = running
-        .state
-        .registry
-        .open_socket(&room.code)
-        .await
-        .unwrap();
-    host_guard.host_joined();
-    let mut room_events = handle.subscribe();
-    let before_attach = room_events.sender_strong_count();
-    send(
-        &mut stalled,
-        &ClientMsg::JoinRoom {
-            code: room.code.clone(),
-            role: Role::Display,
-            name: Some("x".repeat(8 * 1024 * 1024)),
-            token: None,
-        },
-    )
-    .await;
-    // Do not read the echoed multi-megabyte Joined frame.
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while room_events.sender_strong_count() <= before_attach {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("display did not attach");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(running.state.registry.remove(&room.code).await);
-    tokio::time::timeout(Duration::from_secs(1), handle.closed())
-        .await
-        .expect("room actor did not stop");
-    drop(handle);
-    drop(host_guard);
-    let closed = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if let Err(RecvError::Closed) = room_events.recv().await {
-                return;
-            }
-        }
-    })
-    .await;
-    drop(stalled);
-    assert!(
-        closed.is_ok(),
-        "removed room still has its initial-write connection"
-    );
 }

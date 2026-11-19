@@ -1,6 +1,16 @@
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { ControlledElement, ControlledSocket, controlledDocument, memoryStorage } from "./client-adapters.mjs";
+import { ControlledElement, ControlledSocket, controlledDocument, deferred, memoryStorage } from "./client-adapters.mjs";
+
+// Headers and body decoding advance independently, without timers.
+export function deferredRoomRequest() {
+  const response = deferred(), body = deferred(), decoding = deferred();
+  return { response, body, decoding, fetch: () => response.promise,
+    respond(ok = true) {
+      response.resolve({ ok, json() { decoding.resolve(); return body.promise; } });
+    },
+  };
+}
 
 // Executes the real inline ES module and all three allowed native modules. Only
 // browser boundaries (DOM, transport, storage, REST and alerts) are controlled.

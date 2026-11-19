@@ -737,7 +737,7 @@ mod tests {
         // has handled it.
         let mut all = Vec::new();
         while let Some(reply) = replies.recv().await {
-            all.push(reply);
+            all.push(reply.message);
         }
         all
     }

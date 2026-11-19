@@ -5,27 +5,14 @@ use std::time::Duration;
 
 use channel_zero::client_address::ClientAddress;
 use channel_zero::db::Db;
-use channel_zero::direct;
 use channel_zero::protocol::{ClientMsg, Role, ServerMsg};
 use channel_zero::registry::Registry;
-use channel_zero::room::{Command, RoomHandle};
 use channel_zero::state::PromptSet;
 
-async fn completed(handle: &RoomHandle, role: Role, name: Option<&str>, intent: ClientMsg) {
-    let (direct, mut replies) = direct::channel();
-    handle
-        .dispatch(Command {
-            intent,
-            role,
-            name: name.map(String::from),
-            direct,
-        })
-        .await
-        .unwrap();
-    while let Some(reply) = replies.recv().await {
-        assert!(!matches!(reply, ServerMsg::Error { .. }), "{reply:?}");
-    }
-}
+#[path = "common/connection.rs"]
+#[allow(dead_code)]
+mod connection;
+use connection::{join, Connection};
 
 #[tokio::test]
 async fn removal_interrupts_a_blocked_durable_effect() {
@@ -56,37 +43,21 @@ async fn removal_interrupts_a_blocked_durable_effect() {
         )
         .await
         .unwrap();
-    let (handle, socket) = registry.open_socket(&created.code).await.unwrap();
-    socket.host_joined();
-    completed(
-        &handle,
-        Role::Host,
-        None,
-        ClientMsg::AddPlayer { name: "Ann".into() },
-    )
-    .await;
-    completed(&handle, Role::Host, None, ClientMsg::StartCollecting).await;
-    completed(
-        &handle,
-        Role::Player,
-        Some("Ann"),
-        ClientMsg::SubmitResponses {
+    let handle = registry.get(&created.code).await.unwrap();
+    let mut host = Connection::admit(&registry, join(&created, Role::Host, None)).await;
+    host.send(ClientMsg::AddPlayer { name: "Ann".into() }).await;
+    host.send(ClientMsg::StartCollecting).await;
+    host.barrier().await;
+    let mut player = Connection::admit(&registry, join(&created, Role::Player, Some("Ann"))).await;
+    assert!(matches!(player.recv().await, ServerMsg::Assignment { .. }));
+    player
+        .send(ClientMsg::SubmitResponses {
             responses: vec!["Response".into()],
             signoff: "Signoff".into(),
-        },
-    )
-    .await;
-
-    let (direct, _replies) = direct::channel();
-    handle
-        .dispatch(Command {
-            intent: ClientMsg::StartGame,
-            role: Role::Host,
-            name: None,
-            direct,
         })
-        .await
-        .unwrap();
+        .await;
+    player.barrier().await;
+    host.send(ClientMsg::StartGame).await;
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

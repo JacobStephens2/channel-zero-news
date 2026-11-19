@@ -52,7 +52,9 @@ async fn main() {
 
 fn init_tracing() {
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,channel_zero=debug".into()))
+        .with(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,channel_zero=debug".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 }
