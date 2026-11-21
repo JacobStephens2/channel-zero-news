@@ -13,9 +13,9 @@
 //!
 //! One watcher per retained room checks the first of three deadlines:
 //!
-//! * **Host join:** until its host join is acknowledged
-//!   ([`LiveSocket::host_joined`]), at its creation deadline,
-//!   [`IDLE_WITHOUT_SOCKET`] after creation, even with other sockets attached.
+//! * **Host join:** [`IDLE_WITHOUT_SOCKET`] after creation unless its host
+//!   join is acknowledged before then ([`LiveSocket::host_joined`]), even
+//!   with other sockets attached.
 //! * **No socket:** after that any socket keeps it, until
 //!   [`IDLE_WITHOUT_SOCKET`] after the last one closes.
 //! * **Activity:** [`IDLE_WITHOUT_ACTIVITY`] after its creation or its last
@@ -119,6 +119,33 @@ impl RetainedRoom {
     fn is(&self, room: &RoomInstance) -> bool {
         self.serial == room.serial
     }
+
+    fn socket_opened(&mut self) {
+        self.sockets += 1;
+        if self.host_joined && self.sockets == 1 {
+            self.socket_deadline.send_replace(None);
+        }
+    }
+
+    fn acknowledge_host(&mut self) {
+        if self.host_joined {
+            return;
+        }
+        let creation_deadline = *self.socket_deadline.borrow();
+        if creation_deadline.is_some_and(|deadline| Instant::now() < deadline) {
+            self.host_joined = true;
+            // The guard reporting this acknowledgement still counts.
+            self.socket_deadline.send_replace(None);
+        }
+    }
+
+    fn socket_closed(&mut self) {
+        self.sockets -= 1;
+        if self.host_joined && self.sockets == 0 {
+            self.socket_deadline
+                .send_replace(Some(Instant::now() + IDLE_WITHOUT_SOCKET));
+        }
+    }
 }
 
 /// One created room: its join code and serial number. Socket closes and
@@ -162,9 +189,8 @@ pub struct LiveSocket {
 }
 
 impl LiveSocket {
-    /// Record that the room acknowledged this socket's host join. From then
-    /// on any socket keeps the room, which until now its creation deadline
-    /// removes even with sockets attached.
+    /// Record that the room acknowledged this socket's host join before the
+    /// creation deadline. From then on any socket clears the socket deadline.
     pub fn host_joined(&self) {
         self.registry.host_joined(&self.room);
     }
@@ -273,10 +299,7 @@ impl Registry {
     pub async fn open_socket(self: &Arc<Self>, code: &str) -> Option<(RoomHandle, LiveSocket)> {
         let mut rooms = self.write();
         let room = rooms.get_mut(code)?;
-        room.sockets += 1;
-        if room.host_joined && room.sockets == 1 {
-            room.socket_deadline.send_replace(None);
-        }
+        room.socket_opened();
         let handle = room.handle.clone();
         Some((
             handle,
@@ -303,24 +326,14 @@ impl Registry {
     fn host_joined(&self, room: &RoomInstance) {
         let mut rooms = self.write();
         if let Some(retained) = retained_mut(&mut rooms, room) {
-            if !retained.host_joined {
-                retained.host_joined = true;
-                // The guard reporting this acknowledgement still counts.
-                retained.socket_deadline.send_replace(None);
-            }
+            retained.acknowledge_host();
         }
     }
 
     fn socket_closed(&self, room: &RoomInstance) {
         let mut rooms = self.write();
-        let Some(retained) = retained_mut(&mut rooms, room) else {
-            return;
-        };
-        retained.sockets -= 1;
-        if retained.host_joined && retained.sockets == 0 {
-            retained
-                .socket_deadline
-                .send_replace(Some(Instant::now() + IDLE_WITHOUT_SOCKET));
+        if let Some(retained) = retained_mut(&mut rooms, room) {
+            retained.socket_closed();
         }
     }
 
@@ -657,6 +670,21 @@ mod tests {
             .expect("the creation deadline slid past 500 ms");
         assert!(reg.get(&created.code).await.is_none());
         assert_actor_stopped(&handle).await;
+    }
+
+    #[tokio::test]
+    async fn a_late_host_acknowledgement_cannot_cancel_creation_expiry() {
+        let reg = Registry::new();
+        let created = reg.create_room(address(0), sets(), None).await.unwrap();
+        let (handle, socket) = reg.open_socket(&created.code).await.unwrap();
+
+        std::thread::sleep(IDLE_WITHOUT_SOCKET + Duration::from_millis(25));
+        socket.host_joined();
+
+        tokio::time::timeout(Duration::from_secs(1), handle.closed())
+            .await
+            .expect("the late host acknowledgement kept the actor alive");
+        assert!(reg.get(&created.code).await.is_none());
     }
 
     #[tokio::test]
