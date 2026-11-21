@@ -10,6 +10,10 @@ retained room, its actor-acknowledged identity, same-identity replays, bounded
 direct replies, live broadcasts and termination; it owns neither a tab's Room
 session nor authoritative game state.
 
+**Room retention** is the registry policy that keeps or removes a room instance
+based on host acknowledgement, socket presence, and Room activity.
+**Room activity** is an accepted intent that broadcasts a state change.
+
 **Room session**: a tab's current connection and attempt to create or join one
 room with one role and optional player name, including pending acquisition of
 host credentials, acknowledged identity, and its per-tab recovery record; it

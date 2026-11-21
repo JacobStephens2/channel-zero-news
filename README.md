@@ -37,7 +37,7 @@ channel-zero/
     ├── room.rs            per-room actor: command queue, delivery + effect execution
     ├── room_game.rs       opaque, pure Room game: intents → ordered reactions
     ├── direct.rs          per-connection direct reply channel (fixed capacity)
-    ├── registry.rs        in-memory map of live rooms by join code
+    ├── registry.rs        live rooms by join code and Room retention deadlines
     ├── state.rs           shared game value types + limits
     ├── protocol.rs        serde message enums (client intents ↔ server events)
     ├── db.rs              SQLx persistence
@@ -131,24 +131,27 @@ breaks the in-memory game.
 
 ### Room retention
 
-Rooms live only in memory, so the registry (`src/registry.rs`) removes each
-one at the first of three deadlines:
+Rooms live only in memory. The registry (`src/registry.rs`) runs one cancellable
+watcher per retained room instance and owns all three removal deadlines:
 
 * **Host join:** a room whose host join is not acknowledged within 500 ms of
   creation (`IDLE_WITHOUT_SOCKET`) is removed, even with display or player
   sockets attached.
-* **No socket:** once its host has joined, any socket keeps the room; it is
-  removed 500 ms after the last one closes.
-* **Activity:** a room with no room activity for 2 hours
+* **No socket:** once its host join is acknowledged, any socket clears the
+  socket deadline. Each last socket close starts a fresh 500 ms empty interval.
+* **Activity:** a room with no Room activity for 2 hours
   (`IDLE_WITHOUT_ACTIVITY`), counted from creation or its last activity, is
   removed even with sockets attached. Room activity is an intent the room
   accepts and broadcasts as a state change; pings, joins that add no player
-  and rejected intents don't count.
+  and rejected intents don't count. The actor publishes the activity timestamp
+  before queuing the broadcasts.
 
-Removal stops the room's actor. Every socket still attached gets
-`unknown_room` as its last frame and is closed, and the client clears its
-recovery record. Creation retains at most 128 live rooms (`MAX_LIVE_ROOMS`)
-and answers 503 past that.
+Before removing a room on expiry, the registry rechecks the current instance,
+socket state, and activity. Both explicit removal and expiry stop the actor
+and cancel pending durable effects. Attached connections attempt a final
+`unknown_room` within the one-second write grace and then close. A client that
+receives it clears its recovery record. Creation retains at most 128 live rooms
+(`MAX_LIVE_ROOMS`) and answers 503 past that.
 
 ## REST surface
 
