@@ -15,12 +15,11 @@
 //!   channel: one that overflows closes its connection instead.
 //!
 //! The registry stops the actor on removal, including pending durable effects.
-//! Accepted intents that broadcast state changes refresh the activity deadline.
+//! The actor publishes accepted activity for the registry's retention policy.
 //!
 //! Rules and projection belong to [`RoomGame`]; the actor sees only its reactions.
 
 use std::future::Future;
-use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
@@ -70,8 +69,6 @@ impl Delivery {
 pub struct RoomHandle {
     pub(crate) code: String,
     cmd_tx: mpsc::Sender<Command>,
-    /// The actor owns the only sender, so activity closes when it stops.
-    last_activity: watch::Receiver<Instant>,
     #[cfg(test)]
     pub(crate) actor: tokio::task::AbortHandle,
 }
@@ -90,48 +87,24 @@ impl RoomHandle {
     pub async fn closed(&self) {
         self.cmd_tx.closed().await;
     }
-
-    /// Wait for `limit` without accepted, broadcast state changes. The wait
-    /// ends with `RoomClosed` when the actor stops and does not borrow the handle.
-    pub fn inactive_for(
-        &self,
-        limit: Duration,
-    ) -> impl Future<Output = Result<(), RoomClosed>> + Send + 'static {
-        let mut last_activity = self.last_activity.clone();
-        async move {
-            loop {
-                let deadline = *last_activity.borrow_and_update() + limit;
-                tokio::select! {
-                    // Activity at the deadline still counts.
-                    biased;
-                    changed = last_activity.changed() => {
-                        if changed.is_err() {
-                            return Err(RoomClosed);
-                        }
-                    }
-                    () = tokio::time::sleep_until(deadline) => return Ok(()),
-                }
-            }
-        }
-    }
 }
 
 /// Spawn a room actor and return a handle to it. `db` is `None` in tests and
 /// no-database runs, in which case durable effects are simply skipped.
 /// Resolving `stop` ends the actor and drops queued commands and pending effects.
+/// `activity_tx` publishes state changes before their broadcasts are enqueued.
 pub(crate) fn spawn_room(
     code: impl Into<String>,
     prompt_sets: Vec<PromptSet>,
     host_token: impl Into<String>,
     db: Option<Db>,
+    activity_tx: watch::Sender<Instant>,
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> RoomHandle {
     let code = code.into();
     let host_token = host_token.into();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
     let (events_tx, _events_rx) = broadcast::channel(BROADCAST_BUFFER);
-
-    let (activity_tx, last_activity) = watch::channel(Instant::now());
 
     let game = RoomGame::new(code.clone(), prompt_sets, host_token);
     let _task = tokio::spawn(run(
@@ -149,10 +122,8 @@ pub(crate) fn spawn_room(
         cmd_tx,
         #[cfg(test)]
         actor: _task.abort_handle(),
-        last_activity,
     }
 }
-
 /// The actor loop. Owns the state for the room's entire lifetime.
 async fn run(
     mut game: RoomGame,
@@ -221,25 +192,5 @@ async fn run_effect(db: &Option<Db>, code: &str, effect: Effect) {
             Ok(batch) => tracing::info!(room = %code, batch = %batch, "archived round"),
             Err(e) => tracing::error!(room = %code, error = %e, "failed to archive round"),
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The registry's activity wait must end when removal stops the actor.
-    #[tokio::test(start_paused = true)]
-    async fn inactive_for_resolves_with_room_closed_once_the_actor_stops() {
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let handle = spawn_room("ABCD", vec![], "tok", None, async move {
-            let _ = stopped.await;
-        });
-        let inactive = handle.inactive_for(Duration::from_secs(2 * 60 * 60));
-        drop(stop);
-        let ended = tokio::time::timeout(Duration::from_secs(5), inactive)
-            .await
-            .expect("the wait outlived the room's actor");
-        assert!(matches!(ended, Err(RoomClosed)));
     }
 }

@@ -7,9 +7,10 @@ use channel_zero::{
     client_address::ClientAddress,
     connection::Incoming,
     protocol::{ClientMsg, ErrorCode, Role, ServerMsg},
-    registry::{NewRoom, Registry, IDLE_WITHOUT_SOCKET},
+    registry::{NewRoom, Registry, IDLE_WITHOUT_ACTIVITY, IDLE_WITHOUT_SOCKET},
     state::{Phase, PromptSet, MAX_PLAYER_NAME_CHARS, MAX_ROSTER_PLAYERS},
 };
+use tokio::time::{sleep, sleep_until, Instant};
 
 #[path = "common/connection.rs"]
 mod connection;
@@ -653,4 +654,107 @@ async fn creation_deadline_cancels_blocked_output_during_admission_and_after_joi
         assert!(registry.get(&room.code).await.is_none());
         assert!(connection.input.as_ref().unwrap().is_closed());
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pings_plain_joins_and_rejected_intents_do_not_extend_the_activity_deadline() {
+    let (registry, room) = room().await;
+    let mut host = Connection::admit(&registry, join(&room, Role::Host, None)).await;
+    sleep(IDLE_WITHOUT_ACTIVITY / 2).await;
+    host.send(ClientMsg::AddPlayer { name: "Ann".into() }).await;
+    roster(host.recv().await, &["Ann"]);
+    let last_change = Instant::now();
+
+    let quarter = IDLE_WITHOUT_ACTIVITY / 4;
+    for offset in [
+        quarter,
+        quarter * 2,
+        quarter * 3,
+        IDLE_WITHOUT_ACTIVITY - Duration::from_secs(60),
+    ] {
+        sleep_until(last_change + offset).await;
+        host.barrier().await;
+        let mut display = Connection::admit(&registry, join(&room, Role::Display, None)).await;
+        let _player = Connection::admit(&registry, join(&room, Role::Player, Some("Ann"))).await;
+        display.send(ClientMsg::StartGame).await;
+        assert_error(display.recv().await, ErrorCode::Forbidden);
+        host.send(ClientMsg::AddPlayer { name: "Ann".into() }).await;
+        let rejected = host.until(|m| matches!(m, ServerMsg::Error { .. })).await;
+        assert_error(rejected, ErrorCode::InvalidTransition);
+    }
+
+    let deadline = last_change + IDLE_WITHOUT_ACTIVITY;
+    sleep_until(deadline - Duration::from_secs(1)).await;
+    assert!(registry.get(&room.code).await.is_some());
+    assert_error(host.recv().await, ErrorCode::UnknownRoom);
+    assert!(registry.get(&room.code).await.is_none());
+    host.ended().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_state_changes_including_a_join_that_adds_a_player_extend_retention() {
+    let (registry, room) = room().await;
+    let mut host = Connection::admit(&registry, join(&room, Role::Host, None)).await;
+    let window = IDLE_WITHOUT_ACTIVITY - Duration::from_secs(1);
+
+    sleep(window).await;
+    host.send(ClientMsg::AddPlayer { name: "Ann".into() }).await;
+    roster(host.recv().await, &["Ann"]);
+
+    sleep(window).await;
+    let _bo = Connection::admit(&registry, join(&room, Role::Player, Some("Bo"))).await;
+    let state = host
+        .until(|m| matches!(m, ServerMsg::RoomState { .. }))
+        .await;
+    roster(state, &["Ann", "Bo"]);
+
+    sleep(window).await;
+    host.send(ClientMsg::StartCollecting).await;
+    host.until(|m| matches!(m, ServerMsg::RoomState { room } if room.phase == Phase::Collecting))
+        .await;
+    let mut ann = Connection::admit(&registry, join(&room, Role::Player, Some("Ann"))).await;
+    assert!(matches!(ann.recv().await, ServerMsg::Assignment { .. }));
+
+    sleep(window).await;
+    ann.send(ClientMsg::SubmitResponses {
+        responses: vec!["news".into()],
+        signoff: "bye".into(),
+    })
+    .await;
+    host.until(|m| matches!(m, ServerMsg::SubmissionProgress { submitted: 1, .. }))
+        .await;
+
+    sleep(window).await;
+    assert!(registry.get(&room.code).await.is_some());
+    host.barrier().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn activity_expiry_terminates_a_hosted_connection_with_its_first_write_blocked() {
+    let (registry, room) = room().await;
+    let deadline = Instant::now() + IDLE_WITHOUT_ACTIVITY;
+    let mut host = Connection::start(&registry);
+    host.send(join(&room, Role::Host, None)).await;
+    assert!(matches!(
+        host.blocked().await,
+        ServerMsg::Joined {
+            role: Role::Host,
+            ..
+        }
+    ));
+    let mut display = Connection::admit(&registry, join(&room, Role::Display, None)).await;
+
+    // The host is acknowledged before the blocked write. Its guard keeps the
+    // room beyond creation, while the activity deadline still applies.
+    sleep_until(deadline - Duration::from_secs(1)).await;
+    assert!(registry.get(&room.code).await.is_some());
+    assert_error(display.recv().await, ErrorCode::UnknownRoom);
+    assert!(registry.get(&room.code).await.is_none());
+    display.ended().await;
+
+    // A terminal write on the blocked sink gets a one-second grace period.
+    assert!(!host.task.is_finished());
+    host.ended().await;
+    assert!(Instant::now() >= deadline + Duration::from_secs(1));
+    assert!(host.input.as_ref().unwrap().is_closed());
 }
